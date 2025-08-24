@@ -1,0 +1,11 @@
+fastapi
+uvicorn
+pydantic
+python-dotenv
+langchain
+langchain-google-genai
+google-generativeai
+requests
+langchainhub
+PyJWT
+cryptography
