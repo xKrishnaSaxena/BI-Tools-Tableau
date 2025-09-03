@@ -9,3 +9,4 @@ requests
 langchainhub
 PyJWT
 cryptography
+mem0ai
