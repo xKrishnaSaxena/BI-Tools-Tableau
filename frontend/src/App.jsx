@@ -1,7 +1,5 @@
-// frontend/src/App.jsx
 import { useState, useRef, useEffect } from "react";
 
-// Very small table component for JSON rows
 function DataTable({ rows, columns }) {
   if (!rows || rows.length === 0) return null;
   const cols = columns && columns.length ? columns : Object.keys(rows[0]);
@@ -67,8 +65,7 @@ export default function App() {
   const [messages, setMessages] = useState([
     {
       id: 1,
-      text: "Hi! I'm your Tableau assistant.",
-
+      text: "Hey! I’m Alex, your Tableau assistant.",
       sender: "bot",
       attachments: [],
     },

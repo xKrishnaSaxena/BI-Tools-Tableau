@@ -1,16 +1,15 @@
+
 import json
-import re
 import os
-from typing import List, Dict, Any, Optional, Tuple
+import re
+from typing import List, Dict, Any, Optional,Tuple
 
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-# LLMs
 from dotenv import load_dotenv
 
-# Prefer Google; fall back to OpenAI if configured
 try:
     from langchain_google_genai import ChatGoogleGenerativeAI
 except Exception:
@@ -21,12 +20,7 @@ try:
 except Exception:
     ChatOpenAI = None
 
-from langchain import hub
-from langchain.agents import AgentExecutor, create_react_agent
-from langchain.tools import Tool
-
-# Mem0
-from mem0 import MemoryClient
+from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage
 
 from tab_tools import (
     list_tableau_projects,
@@ -34,186 +28,28 @@ from tab_tools import (
     list_tableau_views,
     tableau_get_view_image,
     tableau_get_view_data,
-    publish_mock_datasource,
-    refresh_datasource_now,
-    create_hourly_refresh_schedule,
-    tableau_job_status,
+    publish_mock_datasource
 )
 
-print("BOOT: loading .env ...")
+
+try:
+
+    from mem0 import Mem0 
+except Exception:
+    Mem0 = None 
+
 load_dotenv()
 
-MEM0_API = os.getenv("MEM0_API_KEY")
-USER_ID = os.getenv("USER_ID", "default_user")
-print("BOOT: MEM0_API_KEY loaded?", bool(MEM0_API))
-print("BOOT: USER_ID =", USER_ID)
-
-if not MEM0_API:
-    raise SystemExit("Missing MEM0_API_KEY in .env")
-
-# Initialize Mem0 client
-memory_client = MemoryClient(api_key=MEM0_API)
-
-# Mem0 Helper Functions
-def normalize_text_from_mem(m: Any) -> str:
-    if isinstance(m, dict):
-        return (m.get("memory") or m.get("text") or "").strip()
-    return str(m).strip()
-
-def pick_relevant_memory(query: str, mems: List[Dict[str, Any]], min_score: float = 0.55) -> Optional[str]:
-    q = query.lower()
-    q_tokens = {tok for tok in re.findall(r"[a-zA-Z]{3,}", q)}
-    candidates = []
-    for m in mems[:5]:
-        t = normalize_text_from_mem(m)
-        if not t:
-            continue
-        t_low = t.lower()
-        score = (m.get("score") if isinstance(m, dict) else None) or 0.0
-        overlap = len(q_tokens.intersection(set(re.findall(r"[a-zA-Z]{3,}", t_low))))
-        candidates.append((score, overlap, t))
-    candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
-    for score, overlap, t in candidates:
-        if score >= min_score or overlap >= 1:
-            return t
-    return None
-
-def extract_value_from_memory(query: str, memory_text: str) -> Optional[str]:
-    q = query.lower().strip()
-    t = (memory_text or "").strip()
-    if any(k in q for k in ["my name", "what is my name", "whats my name", "what's my name"]):
-        m = re.search(r"(?:user\s+name\s+is|my\s+name\s+is)\s+([A-Za-z][A-Za-z\s'-]+)", t, re.I)
-        if m:
-            return m.group(1).strip()
-    if any(k in q for k in ["my age", "what is my age", "how old am i"]):
-        m = re.search(r"(?:user\s+age\s+is|my\s+age\s+is|i\s*am|i'm)\s*(\d{1,3})", t, re.I)
-        if m:
-            return m.group(1).strip()
-    if any(k in q for k in ["where do i live", "my city", "my location", "where am i from"]):
-        m = re.search(r"(?:i\s+live\s+in|my\s+city\s+is|user\s+city\s+is)\s+([A-Za-z][A-Za-z\s,'-]+)", t, re.I)
-        if m:
-            return m.group(1).strip()
-    m = re.search(r"\bis\b\s+(.+)$", t, re.I)
-    if m:
-        val = m.group(1).strip()
-        val = re.sub(r"[.\s]+$", "", val)
-        return val if val else None
-    return None
-
-PERSONAL_ATTR_ALIASES = {
-    "name": ["name", "fullname"],
-    "age": ["age"],
-    "city": ["city", "location", "hometown"],
-    "country": ["country", "nation"],
-    "email": ["email", "mail"],
-    "phone": ["phone", "mobile", "number"],
-    "order": ["order", "order number", "order id", "ticket", "case"],
-    "company": ["company", "employer", "org", "organization"],
-    "role": ["role", "title", "position", "designation"],
-    "preference": ["preference", "favorite", "favourite", "likes", "dislikes"],
-}
-
-def best_attr_key(attr_word: str) -> Optional[str]:
-    aw = attr_word.lower()
-    for key, aliases in PERSONAL_ATTR_ALIASES.items():
-        if aw == key or aw in aliases:
-            return key
-    return None
-
-def get_attr_from_mem0(recall_fn, attr_key: str) -> Optional[str]:
-    queries = [attr_key, f"my {attr_key}", f"user {attr_key}"]
-    for q in queries:
-        mems = recall_fn(q, k=5) or []
-        for m in mems:
-            t = normalize_text_from_mem(m)
-            val = extract_value_from_memory(attr_key, t)
-            if val:
-                return val
-        for m in mems:
-            t = normalize_text_from_mem(m)
-            if t:
-                return t
-    return None
-
-def resolve_personal_slots(query: str, recall_fn) -> Tuple[str, Dict[str, str]]:
-    resolved: Dict[str, str] = {}
-    mentions = re.findall(r"\bmy\s+([a-zA-Z][a-zA-Z0-9_-]{1,30})\b", query, re.I)
-    seen = set()
-    attrs = [m for m in mentions if not (m.lower() in seen or seen.add(m.lower()))]
-    for raw_attr in attrs:
-        key = best_attr_key(raw_attr) or raw_attr.lower()
-        val = get_attr_from_mem0(recall_fn, key)
-        if val:
-            resolved[key] = val
-    if not resolved:
-        return (query, resolved)
-    ctx_parts = [f"{k}={v}" for k, v in resolved.items()]
-    context = " | ".join(ctx_parts)
-    augmented = (
-        f"Question: {query}\n"
-        f"User context: {context}\n"
-        f"Answer the question succinctly using the context when helpful."
-    )
-    return augmented, resolved
-
-# Mem0 Adapter
-class Mem0ManagedAdapter:
-    def __init__(self, api_key: str):
-        self.client = MemoryClient(api_key=api_key)
-        print("BOOT: dir(mem0.client) ->", [m for m in dir(self.client) if not m.startswith("_")])
-        print("BOOT: using client.add/search")
-
-    def save(self, user_id: str, text: str, metadata: Optional[Dict[str, Any]] = None) -> None:
-        try:
-            messages = [{"role": "user", "content": text}]
-            self.client.add(messages=messages, user_id=user_id, version="v2", output_format="v1.1")
-        except Exception as e:
-            print(f"WARN: Failed to save memory: {e}")
-
-    def search(self, user_id: str, query: str, k: int = 5) -> List[Dict[str, Any]]:
-        try:
-            filters = {"user_id": user_id}  # Required for v2 API
-            hits = self.client.search(query=query, filters=filters, version="v2", limit=k)
-            if isinstance(hits, dict) and "data" in hits:
-                hits = hits["data"]
-            if isinstance(hits, dict) and "results" in hits:
-                hits = hits["results"]
-            return hits[:k] if isinstance(hits, list) else []
-        except Exception as e:
-            print(f"WARN: Memory search failed: {e}")
-            return []
-
-memory = Mem0ManagedAdapter(MEM0_API)
-
-JSON_CODEBLOCK_RE = re.compile(r"```(?:json|csv|table)?[\s\S]*?```", re.IGNORECASE)
-
-def _clean_output_text(text: str, attachments) -> str:
-    if not isinstance(text, str):
-        return ""
-    text = text.replace("Final Answer:", "").strip()
-    text = re.sub(r'data:image\/[a-zA-Z]+;base64,[A-Za-z0-9+/=\s]+', '', text).strip()
-    text = JSON_CODEBLOCK_RE.sub("", text).strip()
-    has_table = any(a.get("type") == "table" for a in (attachments or []))
-    if has_table:
-        t = text.lstrip()
-        if (t.startswith("[") or t.startswith("{")) or len(t) > 300:
-            text = ""
-    if attachments and not text:
-        for a in attachments:
-            if a.get("caption"):
-                return a["caption"]
-        return "Here’s your data."
-    return text
-
+# ---------------- App setup ----------------
 app = FastAPI(
     title="Tableau Chatbot Agent API",
-    description="An API that uses a LangChain agent to interact with Tableau for visualization + Q&A",
-    version="1.0.0",
+    description="An API that uses a fast, single-shot tool caller to interact with Tableau for visualization + Q&A, with Mem0 memory.",
+    version="2.0.0",
 )
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # tighten in prod
+    allow_origins=["*"],  
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -222,11 +58,13 @@ app.add_middleware(
 # ---------------- LLM selection ----------------
 def make_llm():
     """Pick an LLM based on available keys. Low temp for tool-use reliability."""
+    # Try Google first
     if ChatGoogleGenerativeAI is not None:
         try:
             return ChatGoogleGenerativeAI(model="gemini-2.0-flash-lite", temperature=0)
         except Exception:
             pass
+    # Fall back to OpenAI
     if ChatOpenAI is not None:
         try:
             return ChatOpenAI(model="gpt-4o-mini", temperature=0)
@@ -238,82 +76,209 @@ def make_llm():
 
 llm = make_llm()
 
-# -------------- Prompt (hub w/ local fallback) --------------
-try:
-    prompt = hub.pull("hwchase17/react")
-except Exception:
-    from langchain.prompts import PromptTemplate
-    prompt = PromptTemplate.from_template(
-        """You are a helpful Tableau assistant.
-
-You can use these tools:
-{tools}
-
-Allowed tool names: {tool_names}
-
-Guidelines:
-- If the user wants to SEE a chart, call `tableau_get_view_image`.
-- If the user wants to ANALYZE a chart/table, call `tableau_get_view_data`, then answer from those rows.
-- If asked to refresh a datasource, call `refresh_datasource_now`.
-- Do NOT print raw data URLs or base64 in your final answer.
-- When you fetch an image, just acknowledge it briefly; the UI will display it.
-- ALWAYS prefer using a tool over guessing.
-- If filters are mentioned (e.g., Region=APAC, Year=2024), pass them as JSON to filters_json.
-
-Use a ReAct loop:
-1) Think about what to do.
-2) Action: <tool name> with an Action Input
-3) Observation: tool output
-Repeat 1–3 as needed, then finish with a concise Final Answer.
-
-Question: {input}
-
-{agent_scratchpad}
-"""
-    )
-
-# -------------- Tools wiring --------------
-tools = [
+# ---------------- Tools wiring (same tools, no agent) ----------------
+TOOLS = [
     list_tableau_projects,
     list_tableau_workbooks,
     list_tableau_views,
     tableau_get_view_image,
     tableau_get_view_data,
     publish_mock_datasource,
-    refresh_datasource_now,
-    create_hourly_refresh_schedule,
-    tableau_job_status,
 ]
+TOOL_REGISTRY = {t.name: t for t in TOOLS}
+# ---- Pending-intent (per-session) ----
+PENDING: Dict[str, Dict[str, Any]] = {}
 
-agent = create_react_agent(llm, tools, prompt)
-agent_executor = AgentExecutor(
-    agent=agent,
-    tools=tools,
-    verbose=True,
-    handle_parsing_errors=True,
-    return_intermediate_steps=True,
-)
+def get_pending(session_id: str) -> Optional[Dict[str, Any]]:
+    return PENDING.get(session_id)
 
-# -------------- Schemas --------------
-class ChatRequest(BaseModel):
-    message: str
-    user_id: Optional[str] = USER_ID  # Use environment USER_ID as default
+def set_pending(session_id: str, intent: str, data: Optional[Dict[str, Any]] = None) -> None:
+    PENDING[session_id] = {"intent": intent, "data": data or {}}
 
-class ChatResponse(BaseModel):
-    response: str
-    attachments: Optional[List[Dict[str, Any]]] = None
+def clear_pending(session_id: str) -> None:
+    if session_id in PENDING:
+        del PENDING[session_id]
+
+# ---- Parse publish details from free text or JSON ----
+_P_KV = re.compile(r'(?:\bproject(?:_name)?\b)\s*[:=]\s*["\']?([^,\n;]+?)["\']?(?=,|;|\s|$)', re.I)
+_D_KV = re.compile(r'(?:\bdatasource(?:_name)?\b|data\s*source)\s*[:=]\s*["\']?([^,\n;]+?)["\']?(?=,|;|\s|$)', re.I)
+_OW_KV = re.compile(r'\boverwrite\b\s*[:=]\s*(true|false|yes|no|y|n|1|0)', re.I)
+
+def _to_bool(val: Any) -> Optional[bool]:
+    if isinstance(val, bool):
+        return val
+    s = str(val).strip().lower()
+    if s in ("true","yes","y","1"): return True
+    if s in ("false","no","n","0"): return False
+    return None
+
+def parse_publish_details(text: str) -> Tuple[Optional[str], Optional[str], Optional[bool]]:
+    project_name = None
+    datasource_name = None
+    overwrite = None
+
+    # Try JSON first
+    try:
+        obj = json.loads(text)
+        if isinstance(obj, dict):
+            project_name = obj.get("project") or obj.get("project_name") or project_name
+            datasource_name = obj.get("datasource") or obj.get("datasource_name") or datasource_name
+            if "overwrite" in obj:
+                overwrite = _to_bool(obj.get("overwrite"))
+    except Exception:
+        pass
+
+    # Key=value fallbacks
+    if not project_name:
+        m = _P_KV.search(text)
+        if m: project_name = m.group(1).strip()
+    if not datasource_name:
+        m = _D_KV.search(text)
+        if m: datasource_name = m.group(1).strip()
+    if overwrite is None:
+        m = _OW_KV.search(text)
+        if m: overwrite = _to_bool(m.group(1))
+
+    return project_name, datasource_name, overwrite
+
+def ask_for_publish_names_hint() -> str:
+    return (
+        "Before I publish the mock datasource, what **project name** and **datasource name** should I use?"
+        "\nYou can reply in either format:\n"
+        "- `project=Team Analytics, datasource=Sandbox_Sales, overwrite=true`\n"
+        "- `{\"project\": \"Team Analytics\", \"datasource\": \"Sandbox_Sales\", \"overwrite\": false}`"
+    )
+
+# ---------------- Prompt ----------------
+SYSTEM_PROMPT = """You are a helpful Tableau assistant named Alex.
+
+- If the user wants to SEE a chart, call `tableau_get_view_image`.
+- If the user wants to ANALYZE a chart/table, call `tableau_get_view_data`, then answer from those rows.
+- Prefer using a tool over guessing. If filters are mentioned (e.g., Region=APAC, Year=2024), pass them as JSON to filters_json.
+- Do NOT print raw data URLs or base64 in your final answer.
+- When you fetch an image, just acknowledge it briefly; the UI will display it.
+
+**Important (Publishing mock datasource):**
+- Do NOT call `publish_mock_datasource` with default names.
+- FIRST confirm `project_name` and `datasource_name`. If missing or default-like, ask the user:
+  "What project name and datasource name should I use? (optional: overwrite=true/false)"
+- Only after the user confirms the names, call the tool with those names.
+
+You have access to long-term user memories (if provided below). Use them briefly and relevantly.
+"""
+
+
+# ---------------- Memory layer ----------------
+class LocalMemory:
+    """Simple in-process memory fallback keyed by session_id."""
+    def __init__(self, k: int = 50):
+        self._store: Dict[str, List[str]] = {}
+        self._k = k
+
+    def add(self, session_id: str, text: str):
+        arr = self._store.setdefault(session_id, [])
+        arr.append(text)
+        if len(arr) > 500:  # prevent unbounded growth
+            del arr[: len(arr) - 500]
+
+    def search(self, session_id: str, query: str, k: int = 5) -> List[str]:
+        # naive relevance: return last k snippets
+        arr = self._store.get(session_id, [])
+        return arr[-k:]
+
+# Instantiate Mem0 if available
+MEM0_CLIENT = None
+if Mem0:
+    try:
+        MEM0_CLIENT = Mem0(api_key=os.getenv("MEM0_API_KEY", ""))
+    except Exception:
+        MEM0_CLIENT = None
+
+LOCAL_MEM = LocalMemory()
+
+def memory_add(session_id: str, role: str, text: str):
+    payload = f"[{role}] {text}"
+    # Mem0 first
+    if MEM0_CLIENT:
+        try:
+            # Different versions expose slightly different method names/args;
+            # try common patterns safely:
+            if hasattr(MEM0_CLIENT, "add"):
+                MEM0_CLIENT.add(payload, user_id=session_id)
+            elif hasattr(MEM0_CLIENT, "create"):
+                MEM0_CLIENT.create(payload, user_id=session_id)
+        except Exception:
+            pass
+    # Always mirror to local fallback
+    LOCAL_MEM.add(session_id, payload)
+
+def memory_search(session_id: str, query: str, k: int = 5) -> List[str]:
+    results: List[str] = []
+    # Mem0 retrieval
+    if MEM0_CLIENT:
+        try:
+            if hasattr(MEM0_CLIENT, "search"):
+                hits = MEM0_CLIENT.search(query, user_id=session_id, limit=k)
+            elif hasattr(MEM0_CLIENT, "retrieve"):
+                hits = MEM0_CLIENT.retrieve(query, user_id=session_id, k=k)
+            else:
+                hits = []
+            for h in hits or []:
+                # normalize shape differences
+                txt = (
+                    h.get("text")
+                    or h.get("memory")
+                    or h.get("content")
+                    or str(h)
+                )
+                if txt:
+                    results.append(txt)
+        except Exception:
+            pass
+    # Fallback supplement from local
+    if len(results) < k:
+        results.extend(LOCAL_MEM.search(session_id, query, k=k - len(results)))
+    return results[:k]
+
+# ---------------- Cleaning / attachments (unchanged) ----------------
+JSON_CODEBLOCK_RE = re.compile(r"```(?:json|csv|table)?[\s\S]*?```", re.IGNORECASE)
+
+def _clean_output_text(text: str, attachments) -> str:
+    if not isinstance(text, str):
+        return ""
+    text = text.replace("Final Answer:", "").strip()
+    text = re.sub(r'data:image\/[a-zA-Z]+;base64,[A-Za-z0-9+/=\s]+', '', text).strip()
+    text = JSON_CODEBLOCK_RE.sub("", text).strip()
+
+    has_table = any(a.get("type") == "table" for a in (attachments or []))
+    if has_table:
+        t = text.lstrip()
+        if (t.startswith("[") or t.startswith("{")) or len(t) > 300:
+            text = ""
+
+    if attachments and not text:
+        for a in attachments:
+            if a.get("caption"):
+                return a["caption"]
+        return "Here’s your data."
+    return text
 
 DATA_URL_RE = re.compile(
     r'(data:image/(?:png|jpeg|jpg|gif|webp);base64,[A-Za-z0-9+/=]+)'
 )
 
-# -------------- Helpers --------------
-def _extract_attachments(intermediate_steps):
+def _extract_attachments(tool_steps: List[Dict[str, Any]]):
+    """
+    tool_steps: list of dicts with {name, args, result}
+    Extract images/tables from tool results.
+    """
     attachments = []
-    for _action, observation in intermediate_steps:
-        if not observation:
+    for step in tool_steps:
+        s = step.get("result")
+        if not s:
             continue
-        s = observation if isinstance(observation, str) else str(observation)
+        s = s if isinstance(s, str) else str(s)
+        # Try strict JSON payloads first
         try:
             obj = json.loads(s)
             if isinstance(obj, dict):
@@ -331,66 +296,124 @@ def _extract_attachments(intermediate_steps):
                 continue
         except Exception:
             pass
+        # Fallback: scan for data URLs in free text
         m = DATA_URL_RE.search(s)
         if m:
             attachments.append({"type": "image", "dataUrl": m.group(1), "caption": ""})
     return attachments
 
-# -------------- Routes --------------
+# ---------------- Simple chat schema ----------------
+class ChatRequest(BaseModel):
+    message: str
+    session_id: Optional[str] = "default"  # <-- NEW: scope memories/conversation
+
+class ChatResponse(BaseModel):
+    response: str
+    attachments: Optional[List[Dict[str, Any]]] = None
+
+# ---------------- Routes ----------------
 @app.get("/")
 def read_root():
-    return {"status": "Tableau Chatbot Agent is running!"}
+    return {"status": "Tableau Chatbot Agent is running (fast tool-caller + Mem0)!"}
+
+def _build_messages(req: ChatRequest, recalled: List[str]):
+    memory_blob = "\n".join(f"- {m}" for m in recalled) if recalled else "(none)"
+    sys = SystemMessage(content=SYSTEM_PROMPT + f"\n\n[Recalled user memories]\n{memory_blob}\n")
+    user = HumanMessage(content=req.message)
+    return [sys, user]
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat_endpoint(request: ChatRequest):
     """
-    Free-form natural language. The agent decides which Tableau tool(s) to call.
-    Integrates Mem0 for memory storage and retrieval with personal slot resolution.
+    Free-form natural language. Single-turn tool calling for speed.
+    1) Recall memory (Mem0/local) relevant to the query.
+    2) Let the LLM decide whether to call ONE OR MORE tools.
+    3) Execute tools, provide results, and get a final natural response.
+    4) Store the turn in memory for future questions.
     """
-    # Check if the query is a question
-    def is_question(raw: str) -> bool:
-        tq = raw.strip().lower()
-        return (
-            "?" in raw
-            or tq.startswith(("what ", "whats", "what's", "who ", "where ", "when ", "why ", "how ",
-                              "do i ", "am i ", "is my ", "are my "))
-            or tq.startswith(("list ", "find ", "show ", "recommend ", "suggest ", "give me ", "tell me ", "name"))
-        )
+    # --- 1) recall memory relevant to the current query ---
+    recalled = memory_search(request.session_id or "default", request.message, k=5)
+    session_id = request.session_id or "default"
+    pending = get_pending(session_id)
+    if pending and pending.get("intent") == "publish_mock_datasource":
+        pn, dn, ow = parse_publish_details(request.message)
+        if pn and dn:
+            args = {"project_name": pn, "datasource_name": dn}
+            if ow is not None:
+                args["overwrite"] = ow
+            result = publish_mock_datasource.invoke(args)
+            attachments = _extract_attachments([{"name": "publish_mock_datasource", "args": args, "result": result}])
+            clear_pending(session_id)
+            output_text = _clean_output_text(f"{result}", attachments)
+            memory_add(session_id, "user", request.message)
+            memory_add(session_id, "assistant", output_text)
+            return {"response": output_text, "attachments": attachments}
+        else:
+            # Ask again with explicit format help
+            ask = ask_for_publish_names_hint()
+            memory_add(session_id, "assistant", ask)
+            return {"response": ask, "attachments": []}
+    # --- 2) first LLM call: decide tool calls ---
+    llm_with_tools = llm.bind_tools(TOOLS)
+    msgs = _build_messages(request, recalled)
+    ai_first: AIMessage = llm_with_tools.invoke(msgs)
 
-    if is_question(request.message):
-        # Try memory first for questions
-        mems = memory.search(request.user_id, request.message, k=5)
-        chosen = pick_relevant_memory(request.message, mems or [], min_score=0.55)
-        if chosen:
-            val = extract_value_from_memory(request.message, chosen)
-            if val:
-                # Save the interaction
-                memory.save(request.user_id, request.message, {"kind": "question"})
-                memory.save(request.user_id, val, {"kind": "answer"})
-                return {"response": val, "attachments": []}
-        
-        # Resolve personal slots for context
-        augmented, resolved = resolve_personal_slots(request.message, lambda q, k=5: memory.search(request.user_id, q, k))
-        input_query = augmented if resolved else request.message
-    else:
-        # Non-question: save to Mem0 and acknowledge
-        memory.save(request.user_id, request.message, {"kind": "utterance"})
-        memory.save(request.user_id, "Noted. I've saved that.", {"kind": "answer"})
-        return {"response": "Noted. I've saved that.", "attachments": []}
+    # --- 3) execute tool calls (if any), then finalization call ---
+    tool_steps: List[Dict[str, Any]] = []
+    final_text = ai_first.content or ""
+    if getattr(ai_first, "tool_calls", None):
+        tool_msgs: List[ToolMessage] = []
+        for tc in ai_first.tool_calls:
+            name = tc["name"]
+            args = tc.get("args", {}) or {}
+            tool = TOOL_REGISTRY.get(name)
+            if not tool:
+                continue
 
-    # Use LangChain agent for Tableau-related or unresolved queries
-    result = agent_executor.invoke({"input": input_query})
-    attachments = _extract_attachments(result.get("intermediate_steps", []))
-    raw_text = result.get("output", "Sorry, I couldn't produce a response.")
-    output_text = _clean_output_text(raw_text, attachments)
+            # >>> NEW: enforce asking for names before publishing
+            if name == "publish_mock_datasource":
+                # Parse any details user already provided in their message
+                user_pn, user_dn, user_ow = parse_publish_details(request.message)
+                pn = args.get("project_name") or user_pn
+                dn = args.get("datasource_name") or user_dn
+                ow = args.get("overwrite")
+                if ow is None and user_ow is not None:
+                    ow = user_ow
 
-    # Save the interaction
-    memory.save(request.user_id, request.message, {"kind": "question"})
-    memory.save(request.user_id, output_text, {"kind": "answer"})
+                # If missing OR default-like, ask first
+                if not pn or not dn or pn == "AI Demos" or dn == "AI_Sample_Sales":
+                    set_pending(session_id, "publish_mock_datasource")
+                    ask = ask_for_publish_names_hint()
+                    memory_add(session_id, "assistant", ask)
+                    return {"response": ask, "attachments": []}
+
+                # Otherwise, force-clean args to confirmed names
+                args = {"project_name": pn, "datasource_name": dn}
+                if ow is not None:
+                    args["overwrite"] = bool(ow)
+
+            # Normal tool execution
+            try:
+                result = tool.invoke(args)  # returns str (often JSON)
+            except Exception as e:
+                result = f"Tool '{name}' failed: {e}"
+            tool_steps.append({"name": name, "args": args, "result": result})
+            tool_msgs.append(ToolMessage(tool_call_id=tc["id"], name=name, content=result))
+        # second LLM call to produce the final answer
+        ai_final: AIMessage = llm_with_tools.invoke(msgs + [ai_first] + tool_msgs)
+        final_text = ai_final.content or final_text
+
+    # --- 4) attachments + output cleanup ---
+    attachments = _extract_attachments(tool_steps)
+    output_text = _clean_output_text(final_text, attachments)
+
+    # --- 5) store memories for future turns ---
+    memory_add(request.session_id or "default", "user", request.message)
+    memory_add(request.session_id or "default", "assistant", output_text)
 
     return {"response": output_text, "attachments": attachments}
 
-# Optional: direct REST endpoints
+# -------- Direct REST endpoints (unchanged) --------
 @app.get("/views/image")
 def get_view_image(view_name: str, workbook_name: str = "", filters_json: str = ""):
     payload = {"view_name": view_name, "workbook_name": workbook_name, "filters_json": filters_json}
@@ -405,10 +428,3 @@ def get_view_data(view_name: str, workbook_name: str = "", filters_json: str = "
 def api_publish_mock():
     return {"message": publish_mock_datasource.invoke({})}
 
-@app.post("/datasources/schedule")
-def api_schedule(ds: str = "AI_Sample_Sales", schedule_name: str = "AI-Hourly-Demo"):
-    return {"message": create_hourly_refresh_schedule.invoke({"datasource_name": ds, "schedule_name": schedule_name})}
-
-@app.post("/datasources/refresh-now")
-def api_refresh_now(ds: str = "AI_Sample_Sales"):
-    return {"message": refresh_datasource_now.invoke({"datasource_name": ds})}
