@@ -1,5 +1,5 @@
 
-import os, io, csv, json, base64, tempfile
+import os, io, csv, json, base64
 from typing import Optional,Any
 from dotenv import load_dotenv
 import tableauserverclient as TSC

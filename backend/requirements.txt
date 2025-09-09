@@ -10,3 +10,6 @@ langchainhub
 PyJWT
 cryptography
 mem0ai
+tableauserverclient
+pandas
+pantab
