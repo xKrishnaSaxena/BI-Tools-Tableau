@@ -4,6 +4,7 @@ import os
 import re
 from typing import List, Dict, Any, Optional,Tuple
 
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -31,6 +32,30 @@ from tab_tools import (
     publish_mock_datasource
 )
 
+from fastapi import UploadFile, File, Form
+
+# NEW: LangChain RAG pieces
+try:
+    from langchain_community.document_loaders import PyPDFLoader
+except Exception:
+    PyPDFLoader = None
+
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+
+try:
+    from langchain_google_genai import GoogleGenerativeAIEmbeddings
+except Exception:
+    GoogleGenerativeAIEmbeddings = None
+
+try:
+    from langchain_openai import OpenAIEmbeddings
+except Exception:
+    OpenAIEmbeddings = None
+
+from langchain_community.vectorstores import Milvus
+
+import tempfile
+
 
 try:
 
@@ -54,6 +79,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+RAG_COLLECTION_DEFAULT = os.getenv("RAG_COLLECTION", "tableau_docs")
+ZILLIZ_CLOUD_URI = os.getenv("ZILLIZ_CLOUD_URI")
+ZILLIZ_CLOUD_TOKEN = os.getenv("ZILLIZ_CLOUD_API_KEY") or os.getenv("ZILLIZ_CLOUD_TOKEN")  # either name
 
 # ---------------- LLM selection ----------------
 def make_llm():
@@ -75,6 +103,144 @@ def make_llm():
     )
 
 llm = make_llm()
+
+def _require_rag_env():
+    if not ZILLIZ_CLOUD_URI or not ZILLIZ_CLOUD_TOKEN:
+        raise RuntimeError("ZILLIZ_CLOUD_URI / ZILLIZ_CLOUD_API_KEY missing in environment for RAG.")
+
+def make_embedder():
+    """
+    Prefer Google embeddings (great quality, matches your Gemini usage).
+    Fallback to OpenAI embeddings if available.
+    """
+    if GoogleGenerativeAIEmbeddings is not None and os.getenv("GOOGLE_API_KEY"):
+        try:
+            return GoogleGenerativeAIEmbeddings(model="models/text-embedding-004", google_api_key=os.getenv("GOOGLE_API_KEY"))
+        except Exception:
+            pass
+    if OpenAIEmbeddings is not None and os.getenv("OPENAI_API_KEY"):
+        try:
+            return OpenAIEmbeddings(model="text-embedding-3-large")
+        except Exception:
+            pass
+    raise RuntimeError("No embeddings configured. Set GOOGLE_API_KEY (preferred) or OPENAI_API_KEY.")
+
+EMBEDDINGS = None
+VECTOR_STORES: Dict[str, Milvus] = {}  # cache by collection name
+def _get_or_create_vs(collection_name: str) -> Milvus:
+    """
+    Return a connected Milvus vector store for collection_name.
+    Creates the collection lazily on first upsert.
+    """
+    _require_rag_env()
+    global EMBEDDINGS
+    if EMBEDDINGS is None:
+        EMBEDDINGS = make_embedder()
+
+    if collection_name in VECTOR_STORES:
+        return VECTOR_STORES[collection_name]
+
+    # Connect to existing (or future) collection without inserting docs yet.
+    # langchain_community Milvus supports constructing with just connection + collection.
+    try:
+        vs = Milvus(
+            embedding_function=EMBEDDINGS,           # some versions accept 'embedding'; use both names below
+            connection_args={"uri": ZILLIZ_CLOUD_URI, "token": ZILLIZ_CLOUD_TOKEN, "secure": True},
+            collection_name=collection_name,
+            auto_id=True,
+        )
+    except TypeError:
+        # older signature
+        vs = Milvus(
+            embedding=EMBEDDINGS,
+            connection_args={"uri": ZILLIZ_CLOUD_URI, "token": ZILLIZ_CLOUD_TOKEN, "secure": True},
+            collection_name=collection_name,
+        )
+    VECTOR_STORES[collection_name] = vs
+    return vs
+
+def _split_docs(docs):
+    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+    return splitter.split_documents(docs)
+
+def _load_pdf_bytes_to_docs(file_bytes: bytes, filename: str):
+    if PyPDFLoader is None:
+        raise RuntimeError("PyPDFLoader is not installed. pip install langchain-community pypdf")
+    with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(filename)[1] or ".pdf") as tmp:
+        tmp.write(file_bytes)
+        tmp.flush()
+        loader = PyPDFLoader(tmp.name)
+        return loader.load()
+
+def rag_upsert_pdf(file_bytes: bytes, filename: str, collection_name: str) -> int:
+    """
+    Ingest a single PDF: load -> split -> embed -> upsert to Milvus.
+    Returns number of chunks inserted.
+    """
+    vs = _get_or_create_vs(collection_name)
+    docs = _load_pdf_bytes_to_docs(file_bytes, filename)
+    chunks = _split_docs(docs)
+    # If the collection is new, from_documents is fastest; otherwise add_documents.
+    if collection_name not in VECTOR_STORES or getattr(vs, "_is_empty", False):
+        try:
+            vs_new = Milvus.from_documents(
+                documents=chunks,
+                embedding=EMBEDDINGS if hasattr(EMBEDDINGS, "embed_query") else EMBEDDINGS,
+                connection_args={"uri": ZILLIZ_CLOUD_URI, "token": ZILLIZ_CLOUD_TOKEN, "secure": True},
+                collection_name=collection_name,
+            )
+            VECTOR_STORES[collection_name] = vs_new
+        except Exception:
+            # fallback to incremental add (works if collection already exists)
+            vs.add_documents(chunks)
+    else:
+        vs.add_documents(chunks)
+    return len(chunks)
+
+def rag_search(question: str, collection_name: str, k: int = 4):
+    vs = _get_or_create_vs(collection_name)
+    return vs.similarity_search(question, k=k)
+
+def _format_context(docs) -> str:
+    ctx = []
+    for i, d in enumerate(docs, 1):
+        meta = d.metadata or {}
+        src = meta.get("source", "unknown")
+        page = meta.get("page", meta.get("page_number", "?"))
+        ctx.append(f"[{i}] (source={src}, page={page})\n{d.page_content}")
+    return "\n\n".join(ctx)
+
+def rag_answer_with_llm(question: str, collection_name: str, k: int = 4) -> Dict[str, Any]:
+    """
+    Retrieve, then ask your existing `llm` (ChatGoogleGenerativeAI or ChatOpenAI).
+    """
+    docs = rag_search(question, collection_name, k=k)
+    context = _format_context(docs) if docs else "(no results)"
+    sys = SystemMessage(content=(
+        "You answer strictly from the provided context. "
+        "If the answer is not present, say you don't know. "
+        "Be concise, but accurate. Include short citations like [1], [2] when relevant."
+    ))
+    human = HumanMessage(content=f"Question:\n{question}\n\nContext:\n{context}")
+    try:
+        ai = llm.invoke([sys, human])
+        text = (ai.content or "").strip()
+    except Exception as e:
+        text = f"RAG answering failed: {e}"
+
+    # small inline citation map
+    sources = []
+    for i, d in enumerate(docs, 1):
+        meta = d.metadata or {}
+        sources.append({
+            "rank": i,
+            "source": meta.get("source"),
+            "page": meta.get("page", meta.get("page_number")),
+            "chars": len(d.page_content or ""),
+        })
+    return {"answer": text, "sources": sources, "k": k}
+# ===================== RAG END (globals/helpers) =====================
+
 
 # ---------------- Tools wiring (same tools, no agent) ----------------
 TOOLS = [
@@ -310,28 +476,106 @@ class ChatRequest(BaseModel):
 class ChatResponse(BaseModel):
     response: str
     attachments: Optional[List[Dict[str, Any]]] = None
+class RAGQuery(BaseModel):
+    question: str
+    collection: Optional[str] = None
+    k: int = 4
+
+class RAGUploadResponse(BaseModel):
+    ok: bool
+    inserted: int
+    collection: str
 
 # ---------------- Routes ----------------
 @app.get("/")
 def read_root():
     return {"status": "Tableau Chatbot Agent is running (fast tool-caller + Mem0)!"}
 
-def _build_messages(req: ChatRequest, recalled: List[str]):
+def _build_messages(req: ChatRequest, recalled: List[str], rag_context: str = ""):
     memory_blob = "\n".join(f"- {m}" for m in recalled) if recalled else "(none)"
-    sys = SystemMessage(content=SYSTEM_PROMPT + f"\n\n[Recalled user memories]\n{memory_blob}\n")
+    kb_blob = ""
+    if rag_context:
+        kb_blob = (
+            "\n\n[Knowledge Base Context]\n"
+            f"{rag_context}\n\n"
+            "When the user's question can be answered from the context above, "
+            "answer directly from it and include short bracket citations like [1], [2] "
+            "matching the numbered items in that context. If it is not relevant, proceed normally."
+        )
+    sys = SystemMessage(content=SYSTEM_PROMPT + f"\n\n[Recalled user memories]\n{memory_blob}\n" + kb_blob)
     user = HumanMessage(content=req.message)
     return [sys, user]
 
+@app.post("/rag/upload", response_model=RAGUploadResponse)
+async def rag_upload(
+    file: UploadFile = File(...),
+    collection: str = Form(None),
+):
+    """
+    Upload a single PDF, chunk+embed, and upsert into Milvus.
+    """
+    _require_rag_env()
+    coll = (collection or RAG_COLLECTION_DEFAULT).strip()
+    data = await file.read()
+    inserted = rag_upsert_pdf(data, file.filename, coll)
+    return {"ok": True, "inserted": inserted, "collection": coll}
+
+@app.post("/rag/query", response_model=ChatResponse)
+async def rag_query(q: RAGQuery):
+    """
+    Ask a question against a collection; uses the same LLM for final answer.
+    """
+    coll = (q.collection or RAG_COLLECTION_DEFAULT).strip()
+    result = rag_answer_with_llm(q.question, coll, k=q.k)
+    # Store light memory of the turn (optional)
+    memory_add("default", "user", f"[RAG] {q.question}")
+    memory_add("default", "assistant", result["answer"])
+    return ChatResponse(response=result["answer"], attachments=[{"type": "table", "rows": result["sources"], "columns": ["rank","source","page","chars"], "caption": "Top matches"}])
+
+# ===== Add this helper somewhere above chat_endpoint =====
+def _rag_context_and_sources(question: str, collection_name: str, k: int = 4):
+    """
+    Try to fetch relevant chunks for the question.
+    Returns (context_str, sources_list). If RAG not configured or no hits, returns ("", []).
+    """
+    try:
+        docs = rag_search(question, collection_name, k=k)
+    except Exception:
+        return "", []
+
+    if not docs:
+        return "", []
+
+    context = _format_context(docs)
+    sources = []
+    for i, d in enumerate(docs, 1):
+        meta = d.metadata or {}
+        sources.append({
+            "rank": i,
+            "source": meta.get("source"),
+            "page": meta.get("page", meta.get("page_number")),
+            "chars": len(d.page_content or ""),
+        })
+    return context, sources
+
+
 @app.post("/chat", response_model=ChatResponse)
 async def chat_endpoint(request: ChatRequest):
-    """
-    Free-form natural language. Single-turn tool calling for speed.
-    1) Recall memory (Mem0/local) relevant to the query.
-    2) Let the LLM decide whether to call ONE OR MORE tools.
-    3) Execute tools, provide results, and get a final natural response.
-    4) Store the turn in memory for future questions.
-    """
-    # --- 1) recall memory relevant to the current query ---
+    msg = (request.message or "").strip()
+
+    # ---- 1) "doc:" short-circuit remains ----
+    if msg.lower().startswith("doc:"):
+        q = msg[4:].strip()
+        coll = RAG_COLLECTION_DEFAULT
+        result = rag_answer_with_llm(q, coll, k=4)
+        memory_add(request.session_id or "default", "user", f"[RAG] {q}")
+        memory_add(request.session_id or "default", "assistant", result["answer"])
+        return ChatResponse(
+            response=result["answer"],
+            attachments=[{"type": "table", "rows": result["sources"], "columns": ["rank","source","page","chars"], "caption": "Top matches"}]
+        )
+
+    # ---- 2) recall memory + pending publish flow (unchanged) ----
     recalled = memory_search(request.session_id or "default", request.message, k=5)
     session_id = request.session_id or "default"
     pending = get_pending(session_id)
@@ -349,18 +593,23 @@ async def chat_endpoint(request: ChatRequest):
             memory_add(session_id, "assistant", output_text)
             return {"response": output_text, "attachments": attachments}
         else:
-            # Ask again with explicit format help
             ask = ask_for_publish_names_hint()
             memory_add(session_id, "assistant", ask)
             return {"response": ask, "attachments": []}
-    # --- 2) first LLM call: decide tool calls ---
+
+    # ---- 3) NEW: try to pull RAG context automatically ----
+    rag_context, rag_sources = _rag_context_and_sources(msg, RAG_COLLECTION_DEFAULT, k=4)
+
+    # ---- 4) build messages (now include RAG context when present) ----
     llm_with_tools = llm.bind_tools(TOOLS)
-    msgs = _build_messages(request, recalled)
+    msgs = _build_messages(request, recalled, rag_context=rag_context)
+
     ai_first: AIMessage = llm_with_tools.invoke(msgs)
 
-    # --- 3) execute tool calls (if any), then finalization call ---
     tool_steps: List[Dict[str, Any]] = []
     final_text = ai_first.content or ""
+
+    # ---- 5) tool calling loop (unchanged) ----
     if getattr(ai_first, "tool_calls", None):
         tool_msgs: List[ToolMessage] = []
         for tc in ai_first.tool_calls:
@@ -370,9 +619,7 @@ async def chat_endpoint(request: ChatRequest):
             if not tool:
                 continue
 
-            # >>> NEW: enforce asking for names before publishing
             if name == "publish_mock_datasource":
-                # Parse any details user already provided in their message
                 user_pn, user_dn, user_ow = parse_publish_details(request.message)
                 pn = args.get("project_name") or user_pn
                 dn = args.get("datasource_name") or user_dn
@@ -380,34 +627,38 @@ async def chat_endpoint(request: ChatRequest):
                 if ow is None and user_ow is not None:
                     ow = user_ow
 
-                # If missing OR default-like, ask first
                 if not pn or not dn or pn == "AI Demos" or dn == "AI_Sample_Sales":
                     set_pending(session_id, "publish_mock_datasource")
                     ask = ask_for_publish_names_hint()
                     memory_add(session_id, "assistant", ask)
                     return {"response": ask, "attachments": []}
 
-                # Otherwise, force-clean args to confirmed names
                 args = {"project_name": pn, "datasource_name": dn}
                 if ow is not None:
                     args["overwrite"] = bool(ow)
 
-            # Normal tool execution
             try:
-                result = tool.invoke(args)  # returns str (often JSON)
+                result = tool.invoke(args)
             except Exception as e:
                 result = f"Tool '{name}' failed: {e}"
             tool_steps.append({"name": name, "args": args, "result": result})
             tool_msgs.append(ToolMessage(tool_call_id=tc["id"], name=name, content=result))
-        # second LLM call to produce the final answer
+
         ai_final: AIMessage = llm_with_tools.invoke(msgs + [ai_first] + tool_msgs)
         final_text = ai_final.content or final_text
 
-    # --- 4) attachments + output cleanup ---
+    # ---- 6) Build attachments: tool outputs + (NEW) RAG sources ----
     attachments = _extract_attachments(tool_steps)
+    if rag_sources:
+        attachments.append({
+            "type": "table",
+            "rows": rag_sources,
+            "columns": ["rank","source","page","chars"],
+            "caption": "Top matches (RAG)"
+        })
+
     output_text = _clean_output_text(final_text, attachments)
 
-    # --- 5) store memories for future turns ---
     memory_add(request.session_id or "default", "user", request.message)
     memory_add(request.session_id or "default", "assistant", output_text)
 
