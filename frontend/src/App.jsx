@@ -95,7 +95,7 @@ export default function App() {
 
     try {
       const response = await fetch(
-        "https://agent-tableau-backend.onrender.com/chat",
+        "http://localhost:8000/chat",
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },

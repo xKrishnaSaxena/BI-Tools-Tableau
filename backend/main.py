@@ -1,8 +1,8 @@
+
 import json
 import os
 import re
-import time
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional,Tuple
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -31,12 +31,12 @@ from tab_tools import (
     publish_mock_datasource
 )
 
-from fastapi import UploadFile, File, Form
 
 try:
-    from mem0 import MemoryClient
+
+    from mem0 import Mem0 
 except Exception:
-    MemoryClient = None
+    Mem0 = None 
 
 load_dotenv()
 
@@ -76,7 +76,7 @@ def make_llm():
 
 llm = make_llm()
 
-# ---------------- Tools wiring ----------------
+# ---------------- Tools wiring (same tools, no agent) ----------------
 TOOLS = [
     list_tableau_projects,
     list_tableau_workbooks,
@@ -86,7 +86,6 @@ TOOLS = [
     publish_mock_datasource,
 ]
 TOOL_REGISTRY = {t.name: t for t in TOOLS}
-
 # ---- Pending-intent (per-session) ----
 PENDING: Dict[str, Dict[str, Any]] = {}
 
@@ -168,6 +167,7 @@ SYSTEM_PROMPT = """You are a helpful Tableau assistant named Alex.
 You have access to long-term user memories (if provided below). Use them briefly and relevantly.
 """
 
+
 # ---------------- Memory layer ----------------
 class LocalMemory:
     """Simple in-process memory fallback keyed by session_id."""
@@ -186,78 +186,43 @@ class LocalMemory:
         arr = self._store.get(session_id, [])
         return arr[-k:]
 
-# Memory adapter for Mem0 (Managed / chat-style)
-class MemoryPort:
-    def save(self, user_id: str, text: str, metadata: Optional[Dict[str, Any]] = None) -> None: ...
-    def search(self, user_id: str, query: str, k: int = 5) -> List[Dict[str, Any]]: ...
+# Instantiate Mem0 if available
+MEM0_CLIENT = None
+if Mem0:
+    try:
+        MEM0_CLIENT = Mem0(api_key=os.getenv("MEM0_API_KEY", ""))
+    except Exception:
+        MEM0_CLIENT = None
 
-class Mem0ManagedAdapter(MemoryPort):
-    def __init__(self, api_key: str):
-        if not api_key:
-            raise SystemExit("Missing MEM0_API_KEY in .env")
-        self.client = MemoryClient(api_key=api_key)
-        visible = [m for m in dir(self.client) if not m.startswith("_")]
-        print("BOOT: dir(mem0.client) ->", visible)
-        print("BOOT: using client.add/search")
-
-    def save(self, user_id: str, text: str, metadata: Optional[Dict[str, Any]] = None) -> None:
-        try:
-            result = self.client.add(
-                messages=[{"role": "user", "content": text}],
-                user_id=user_id,
-                async_mode=True,
-                output_format="v1.1"
-            )
-            print(f"Mem0 save result: {result}")  # Debug log
-            if not (isinstance(result, dict) and result.get("results", [{}])[0].get("status") in ["success", "PENDING"]):
-                print("WARN: Mem0 save failed:", result)
-        except Exception as e:
-            print("WARN: save_memory failed:", e)
-
-    def search(self, user_id: str, query: str, k: int = 5, retries: int = 2) -> List[Dict[str, Any]]:
-        for attempt in range(retries + 1):
-            try:
-                hits = self.client.search(user_id=user_id, query=query, limit=k)
-                if isinstance(hits, dict) and "data" in hits:
-                    hits = hits["data"]
-                if isinstance(hits, dict) and "results" in hits:
-                    hits = hits["results"]
-                if hits:
-                    return hits[:k] if isinstance(hits, list) else []
-                if attempt < retries:
-                    time.sleep(1)
-                    continue
-                return []
-            except Exception as e:
-                print("WARN: Mem0 search failed:", e)
-                if attempt < retries:
-                    time.sleep(1)
-                    continue
-                return []
-
-# Instantiate Mem0 with validation
-MEM0_API = os.getenv("MEM0_API_KEY")
-print("BOOT: MEM0_API_KEY loaded?", bool(MEM0_API))
-memory: MemoryPort = Mem0ManagedAdapter(MEM0_API) if MemoryClient else None
 LOCAL_MEM = LocalMemory()
 
 def memory_add(session_id: str, role: str, text: str):
-    payload = f"[{role}] {text}"
-    # Mem0 first
-    if memory:
-        try:
-            memory.save(session_id, payload)
-        except Exception as e:
-            print("WARN: memory_add failed:", e)
-    # Always mirror to local fallback
-    LOCAL_MEM.add(session_id, payload)
+    cleaned_text = text.strip()
+    if role == "user":  # Only store user queries
+        payload = {"text": cleaned_text, "role": role}
+        metadata = {
+            "category": "personal_info" if any(keyword in cleaned_text.lower() for keyword in ["name is", "i am"]) else "general",
+            "is_user_statement": True
+        }
+        if MEM0_CLIENT:
+            try:
+                MEM0_CLIENT.add(cleaned_text, user_id=session_id, metadata=metadata)
+                logger.debug(f"Added to Mem0: [session={session_id}, role={role}, metadata={metadata}] {cleaned_text}")
+            except Exception as e:
+                logger.error(f"Mem0 add failed: {e}")
+        LOCAL_MEM.add(session_id, f"[{role}] {cleaned_text}")
 
 def memory_search(session_id: str, query: str, k: int = 5) -> List[str]:
     results: List[str] = []
     # Mem0 retrieval
-    if memory:
+    if MEM0_CLIENT:
         try:
-            hits = memory.search(session_id, query, k)
+            if hasattr(MEM0_CLIENT, "search"):
+                hits = MEM0_CLIENT.search(query, user_id=session_id, limit=k)
+            elif hasattr(MEM0_CLIENT, "retrieve"):
+                hits = MEM0_CLIENT.retrieve(query, user_id=session_id, k=k)
+            else:
+                hits = []
             for h in hits or []:
                 # normalize shape differences
                 txt = (
@@ -268,14 +233,14 @@ def memory_search(session_id: str, query: str, k: int = 5) -> List[str]:
                 )
                 if txt:
                     results.append(txt)
-        except Exception as e:
-            print("WARN: memory_search failed:", e)
+        except Exception:
+            pass
     # Fallback supplement from local
     if len(results) < k:
         results.extend(LOCAL_MEM.search(session_id, query, k=k - len(results)))
     return results[:k]
 
-# ---------------- Cleaning / attachments ----------------
+# ---------------- Cleaning / attachments (unchanged) ----------------
 JSON_CODEBLOCK_RE = re.compile(r"```(?:json|csv|table)?[\s\S]*?```", re.IGNORECASE)
 
 def _clean_output_text(text: str, attachments) -> str:
@@ -340,7 +305,7 @@ def _extract_attachments(tool_steps: List[Dict[str, Any]]):
 # ---------------- Simple chat schema ----------------
 class ChatRequest(BaseModel):
     message: str
-    session_id: Optional[str] = "default"  # scope memories/conversation
+    session_id: Optional[str] = "default"  # <-- NEW: scope memories/conversation
 
 class ChatResponse(BaseModel):
     response: str
@@ -353,15 +318,20 @@ def read_root():
 
 def _build_messages(req: ChatRequest, recalled: List[str]):
     memory_blob = "\n".join(f"- {m}" for m in recalled) if recalled else "(none)"
-    sys = SystemMessage(content=SYSTEM_PROMPT + f"\n\n[Recalled user memories]\n{memory_blob}")
+    sys = SystemMessage(content=SYSTEM_PROMPT + f"\n\n[Recalled user memories]\n{memory_blob}\n")
     user = HumanMessage(content=req.message)
     return [sys, user]
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat_endpoint(request: ChatRequest):
-    msg = (request.message or "").strip()
-
-    # ---- Recall memory + pending publish flow ----
+    """
+    Free-form natural language. Single-turn tool calling for speed.
+    1) Recall memory (Mem0/local) relevant to the query.
+    2) Let the LLM decide whether to call ONE OR MORE tools.
+    3) Execute tools, provide results, and get a final natural response.
+    4) Store the turn in memory for future questions.
+    """
+    # --- 1) recall memory relevant to the current query ---
     recalled = memory_search(request.session_id or "default", request.message, k=5)
     session_id = request.session_id or "default"
     pending = get_pending(session_id)
@@ -379,20 +349,18 @@ async def chat_endpoint(request: ChatRequest):
             memory_add(session_id, "assistant", output_text)
             return {"response": output_text, "attachments": attachments}
         else:
+            # Ask again with explicit format help
             ask = ask_for_publish_names_hint()
             memory_add(session_id, "assistant", ask)
             return {"response": ask, "attachments": []}
-
-    # ---- Build messages ----
+    # --- 2) first LLM call: decide tool calls ---
     llm_with_tools = llm.bind_tools(TOOLS)
     msgs = _build_messages(request, recalled)
-
     ai_first: AIMessage = llm_with_tools.invoke(msgs)
 
+    # --- 3) execute tool calls (if any), then finalization call ---
     tool_steps: List[Dict[str, Any]] = []
     final_text = ai_first.content or ""
-
-    # ---- Tool calling loop ----
     if getattr(ai_first, "tool_calls", None):
         tool_msgs: List[ToolMessage] = []
         for tc in ai_first.tool_calls:
@@ -402,7 +370,9 @@ async def chat_endpoint(request: ChatRequest):
             if not tool:
                 continue
 
+            # >>> NEW: enforce asking for names before publishing
             if name == "publish_mock_datasource":
+                # Parse any details user already provided in their message
                 user_pn, user_dn, user_ow = parse_publish_details(request.message)
                 pn = args.get("project_name") or user_pn
                 dn = args.get("datasource_name") or user_dn
@@ -410,37 +380,40 @@ async def chat_endpoint(request: ChatRequest):
                 if ow is None and user_ow is not None:
                     ow = user_ow
 
+                # If missing OR default-like, ask first
                 if not pn or not dn or pn == "AI Demos" or dn == "AI_Sample_Sales":
                     set_pending(session_id, "publish_mock_datasource")
                     ask = ask_for_publish_names_hint()
                     memory_add(session_id, "assistant", ask)
                     return {"response": ask, "attachments": []}
 
+                # Otherwise, force-clean args to confirmed names
                 args = {"project_name": pn, "datasource_name": dn}
                 if ow is not None:
                     args["overwrite"] = bool(ow)
 
+            # Normal tool execution
             try:
-                result = tool.invoke(args)
+                result = tool.invoke(args)  # returns str (often JSON)
             except Exception as e:
                 result = f"Tool '{name}' failed: {e}"
             tool_steps.append({"name": name, "args": args, "result": result})
             tool_msgs.append(ToolMessage(tool_call_id=tc["id"], name=name, content=result))
-
+        # second LLM call to produce the final answer
         ai_final: AIMessage = llm_with_tools.invoke(msgs + [ai_first] + tool_msgs)
         final_text = ai_final.content or final_text
 
-    # ---- Build attachments from tool outputs ----
+    # --- 4) attachments + output cleanup ---
     attachments = _extract_attachments(tool_steps)
-
     output_text = _clean_output_text(final_text, attachments)
 
+    # --- 5) store memories for future turns ---
     memory_add(request.session_id or "default", "user", request.message)
     memory_add(request.session_id or "default", "assistant", output_text)
 
     return {"response": output_text, "attachments": attachments}
 
-# -------- Direct REST endpoints --------
+# -------- Direct REST endpoints (unchanged) --------
 @app.get("/views/image")
 def get_view_image(view_name: str, workbook_name: str = "", filters_json: str = ""):
     payload = {"view_name": view_name, "workbook_name": workbook_name, "filters_json": filters_json}
