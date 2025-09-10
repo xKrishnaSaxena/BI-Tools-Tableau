@@ -1,9 +1,8 @@
-
 import json
 import os
 import re
-from typing import List, Dict, Any, Optional,Tuple
-
+import time
+from typing import List, Dict, Any, Optional, Tuple
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -34,34 +33,10 @@ from tab_tools import (
 
 from fastapi import UploadFile, File, Form
 
-# NEW: LangChain RAG pieces
 try:
-    from langchain_community.document_loaders import PyPDFLoader
+    from mem0 import MemoryClient
 except Exception:
-    PyPDFLoader = None
-
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-
-try:
-    from langchain_google_genai import GoogleGenerativeAIEmbeddings
-except Exception:
-    GoogleGenerativeAIEmbeddings = None
-
-try:
-    from langchain_openai import OpenAIEmbeddings
-except Exception:
-    OpenAIEmbeddings = None
-
-from langchain_community.vectorstores import Milvus
-
-import tempfile
-
-
-try:
-
-    from mem0 import Mem0 
-except Exception:
-    Mem0 = None 
+    MemoryClient = None
 
 load_dotenv()
 
@@ -79,9 +54,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-RAG_COLLECTION_DEFAULT = os.getenv("RAG_COLLECTION", "tableau_docs")
-ZILLIZ_CLOUD_URI = os.getenv("ZILLIZ_CLOUD_URI")
-ZILLIZ_CLOUD_TOKEN = os.getenv("ZILLIZ_CLOUD_API_KEY") or os.getenv("ZILLIZ_CLOUD_TOKEN")  # either name
 
 # ---------------- LLM selection ----------------
 def make_llm():
@@ -104,145 +76,7 @@ def make_llm():
 
 llm = make_llm()
 
-def _require_rag_env():
-    if not ZILLIZ_CLOUD_URI or not ZILLIZ_CLOUD_TOKEN:
-        raise RuntimeError("ZILLIZ_CLOUD_URI / ZILLIZ_CLOUD_API_KEY missing in environment for RAG.")
-
-def make_embedder():
-    """
-    Prefer Google embeddings (great quality, matches your Gemini usage).
-    Fallback to OpenAI embeddings if available.
-    """
-    if GoogleGenerativeAIEmbeddings is not None and os.getenv("GOOGLE_API_KEY"):
-        try:
-            return GoogleGenerativeAIEmbeddings(model="models/text-embedding-004", google_api_key=os.getenv("GOOGLE_API_KEY"))
-        except Exception:
-            pass
-    if OpenAIEmbeddings is not None and os.getenv("OPENAI_API_KEY"):
-        try:
-            return OpenAIEmbeddings(model="text-embedding-3-large")
-        except Exception:
-            pass
-    raise RuntimeError("No embeddings configured. Set GOOGLE_API_KEY (preferred) or OPENAI_API_KEY.")
-
-EMBEDDINGS = None
-VECTOR_STORES: Dict[str, Milvus] = {}  # cache by collection name
-def _get_or_create_vs(collection_name: str) -> Milvus:
-    """
-    Return a connected Milvus vector store for collection_name.
-    Creates the collection lazily on first upsert.
-    """
-    _require_rag_env()
-    global EMBEDDINGS
-    if EMBEDDINGS is None:
-        EMBEDDINGS = make_embedder()
-
-    if collection_name in VECTOR_STORES:
-        return VECTOR_STORES[collection_name]
-
-    # Connect to existing (or future) collection without inserting docs yet.
-    # langchain_community Milvus supports constructing with just connection + collection.
-    try:
-        vs = Milvus(
-            embedding_function=EMBEDDINGS,           # some versions accept 'embedding'; use both names below
-            connection_args={"uri": ZILLIZ_CLOUD_URI, "token": ZILLIZ_CLOUD_TOKEN, "secure": True},
-            collection_name=collection_name,
-            auto_id=True,
-        )
-    except TypeError:
-        # older signature
-        vs = Milvus(
-            embedding=EMBEDDINGS,
-            connection_args={"uri": ZILLIZ_CLOUD_URI, "token": ZILLIZ_CLOUD_TOKEN, "secure": True},
-            collection_name=collection_name,
-        )
-    VECTOR_STORES[collection_name] = vs
-    return vs
-
-def _split_docs(docs):
-    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
-    return splitter.split_documents(docs)
-
-def _load_pdf_bytes_to_docs(file_bytes: bytes, filename: str):
-    if PyPDFLoader is None:
-        raise RuntimeError("PyPDFLoader is not installed. pip install langchain-community pypdf")
-    with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(filename)[1] or ".pdf") as tmp:
-        tmp.write(file_bytes)
-        tmp.flush()
-        loader = PyPDFLoader(tmp.name)
-        return loader.load()
-
-def rag_upsert_pdf(file_bytes: bytes, filename: str, collection_name: str) -> int:
-    """
-    Ingest a single PDF: load -> split -> embed -> upsert to Milvus.
-    Returns number of chunks inserted.
-    """
-    vs = _get_or_create_vs(collection_name)
-    docs = _load_pdf_bytes_to_docs(file_bytes, filename)
-    chunks = _split_docs(docs)
-    # If the collection is new, from_documents is fastest; otherwise add_documents.
-    if collection_name not in VECTOR_STORES or getattr(vs, "_is_empty", False):
-        try:
-            vs_new = Milvus.from_documents(
-                documents=chunks,
-                embedding=EMBEDDINGS if hasattr(EMBEDDINGS, "embed_query") else EMBEDDINGS,
-                connection_args={"uri": ZILLIZ_CLOUD_URI, "token": ZILLIZ_CLOUD_TOKEN, "secure": True},
-                collection_name=collection_name,
-            )
-            VECTOR_STORES[collection_name] = vs_new
-        except Exception:
-            # fallback to incremental add (works if collection already exists)
-            vs.add_documents(chunks)
-    else:
-        vs.add_documents(chunks)
-    return len(chunks)
-
-def rag_search(question: str, collection_name: str, k: int = 4):
-    vs = _get_or_create_vs(collection_name)
-    return vs.similarity_search(question, k=k)
-
-def _format_context(docs) -> str:
-    ctx = []
-    for i, d in enumerate(docs, 1):
-        meta = d.metadata or {}
-        src = meta.get("source", "unknown")
-        page = meta.get("page", meta.get("page_number", "?"))
-        ctx.append(f"[{i}] (source={src}, page={page})\n{d.page_content}")
-    return "\n\n".join(ctx)
-
-def rag_answer_with_llm(question: str, collection_name: str, k: int = 4) -> Dict[str, Any]:
-    """
-    Retrieve, then ask your existing `llm` (ChatGoogleGenerativeAI or ChatOpenAI).
-    """
-    docs = rag_search(question, collection_name, k=k)
-    context = _format_context(docs) if docs else "(no results)"
-    sys = SystemMessage(content=(
-        "You answer strictly from the provided context. "
-        "If the answer is not present, say you don't know. "
-        "Be concise, but accurate. Include short citations like [1], [2] when relevant."
-    ))
-    human = HumanMessage(content=f"Question:\n{question}\n\nContext:\n{context}")
-    try:
-        ai = llm.invoke([sys, human])
-        text = (ai.content or "").strip()
-    except Exception as e:
-        text = f"RAG answering failed: {e}"
-
-    # small inline citation map
-    sources = []
-    for i, d in enumerate(docs, 1):
-        meta = d.metadata or {}
-        sources.append({
-            "rank": i,
-            "source": meta.get("source"),
-            "page": meta.get("page", meta.get("page_number")),
-            "chars": len(d.page_content or ""),
-        })
-    return {"answer": text, "sources": sources, "k": k}
-# ===================== RAG END (globals/helpers) =====================
-
-
-# ---------------- Tools wiring (same tools, no agent) ----------------
+# ---------------- Tools wiring ----------------
 TOOLS = [
     list_tableau_projects,
     list_tableau_workbooks,
@@ -252,6 +86,7 @@ TOOLS = [
     publish_mock_datasource,
 ]
 TOOL_REGISTRY = {t.name: t for t in TOOLS}
+
 # ---- Pending-intent (per-session) ----
 PENDING: Dict[str, Dict[str, Any]] = {}
 
@@ -333,7 +168,6 @@ SYSTEM_PROMPT = """You are a helpful Tableau assistant named Alex.
 You have access to long-term user memories (if provided below). Use them briefly and relevantly.
 """
 
-
 # ---------------- Memory layer ----------------
 class LocalMemory:
     """Simple in-process memory fallback keyed by session_id."""
@@ -352,43 +186,78 @@ class LocalMemory:
         arr = self._store.get(session_id, [])
         return arr[-k:]
 
-# Instantiate Mem0 if available
-MEM0_CLIENT = None
-if Mem0:
-    try:
-        MEM0_CLIENT = Mem0(api_key=os.getenv("MEM0_API_KEY", ""))
-    except Exception:
-        MEM0_CLIENT = None
+# Memory adapter for Mem0 (Managed / chat-style)
+class MemoryPort:
+    def save(self, user_id: str, text: str, metadata: Optional[Dict[str, Any]] = None) -> None: ...
+    def search(self, user_id: str, query: str, k: int = 5) -> List[Dict[str, Any]]: ...
 
+class Mem0ManagedAdapter(MemoryPort):
+    def __init__(self, api_key: str):
+        if not api_key:
+            raise SystemExit("Missing MEM0_API_KEY in .env")
+        self.client = MemoryClient(api_key=api_key)
+        visible = [m for m in dir(self.client) if not m.startswith("_")]
+        print("BOOT: dir(mem0.client) ->", visible)
+        print("BOOT: using client.add/search")
+
+    def save(self, user_id: str, text: str, metadata: Optional[Dict[str, Any]] = None) -> None:
+        try:
+            result = self.client.add(
+                messages=[{"role": "user", "content": text}],
+                user_id=user_id,
+                async_mode=True,
+                output_format="v1.1"
+            )
+            print(f"Mem0 save result: {result}")  # Debug log
+            if not (isinstance(result, dict) and result.get("results", [{}])[0].get("status") in ["success", "PENDING"]):
+                print("WARN: Mem0 save failed:", result)
+        except Exception as e:
+            print("WARN: save_memory failed:", e)
+
+    def search(self, user_id: str, query: str, k: int = 5, retries: int = 2) -> List[Dict[str, Any]]:
+        for attempt in range(retries + 1):
+            try:
+                hits = self.client.search(user_id=user_id, query=query, limit=k)
+                if isinstance(hits, dict) and "data" in hits:
+                    hits = hits["data"]
+                if isinstance(hits, dict) and "results" in hits:
+                    hits = hits["results"]
+                if hits:
+                    return hits[:k] if isinstance(hits, list) else []
+                if attempt < retries:
+                    time.sleep(1)
+                    continue
+                return []
+            except Exception as e:
+                print("WARN: Mem0 search failed:", e)
+                if attempt < retries:
+                    time.sleep(1)
+                    continue
+                return []
+
+# Instantiate Mem0 with validation
+MEM0_API = os.getenv("MEM0_API_KEY")
+print("BOOT: MEM0_API_KEY loaded?", bool(MEM0_API))
+memory: MemoryPort = Mem0ManagedAdapter(MEM0_API) if MemoryClient else None
 LOCAL_MEM = LocalMemory()
 
 def memory_add(session_id: str, role: str, text: str):
     payload = f"[{role}] {text}"
     # Mem0 first
-    if MEM0_CLIENT:
+    if memory:
         try:
-            # Different versions expose slightly different method names/args;
-            # try common patterns safely:
-            if hasattr(MEM0_CLIENT, "add"):
-                MEM0_CLIENT.add(payload, user_id=session_id)
-            elif hasattr(MEM0_CLIENT, "create"):
-                MEM0_CLIENT.create(payload, user_id=session_id)
-        except Exception:
-            pass
+            memory.save(session_id, payload)
+        except Exception as e:
+            print("WARN: memory_add failed:", e)
     # Always mirror to local fallback
     LOCAL_MEM.add(session_id, payload)
 
 def memory_search(session_id: str, query: str, k: int = 5) -> List[str]:
     results: List[str] = []
     # Mem0 retrieval
-    if MEM0_CLIENT:
+    if memory:
         try:
-            if hasattr(MEM0_CLIENT, "search"):
-                hits = MEM0_CLIENT.search(query, user_id=session_id, limit=k)
-            elif hasattr(MEM0_CLIENT, "retrieve"):
-                hits = MEM0_CLIENT.retrieve(query, user_id=session_id, k=k)
-            else:
-                hits = []
+            hits = memory.search(session_id, query, k)
             for h in hits or []:
                 # normalize shape differences
                 txt = (
@@ -399,14 +268,14 @@ def memory_search(session_id: str, query: str, k: int = 5) -> List[str]:
                 )
                 if txt:
                     results.append(txt)
-        except Exception:
-            pass
+        except Exception as e:
+            print("WARN: memory_search failed:", e)
     # Fallback supplement from local
     if len(results) < k:
         results.extend(LOCAL_MEM.search(session_id, query, k=k - len(results)))
     return results[:k]
 
-# ---------------- Cleaning / attachments (unchanged) ----------------
+# ---------------- Cleaning / attachments ----------------
 JSON_CODEBLOCK_RE = re.compile(r"```(?:json|csv|table)?[\s\S]*?```", re.IGNORECASE)
 
 def _clean_output_text(text: str, attachments) -> str:
@@ -471,111 +340,28 @@ def _extract_attachments(tool_steps: List[Dict[str, Any]]):
 # ---------------- Simple chat schema ----------------
 class ChatRequest(BaseModel):
     message: str
-    session_id: Optional[str] = "default"  # <-- NEW: scope memories/conversation
+    session_id: Optional[str] = "default"  # scope memories/conversation
 
 class ChatResponse(BaseModel):
     response: str
     attachments: Optional[List[Dict[str, Any]]] = None
-class RAGQuery(BaseModel):
-    question: str
-    collection: Optional[str] = None
-    k: int = 4
-
-class RAGUploadResponse(BaseModel):
-    ok: bool
-    inserted: int
-    collection: str
 
 # ---------------- Routes ----------------
 @app.get("/")
 def read_root():
     return {"status": "Tableau Chatbot Agent is running (fast tool-caller + Mem0)!"}
 
-def _build_messages(req: ChatRequest, recalled: List[str], rag_context: str = ""):
+def _build_messages(req: ChatRequest, recalled: List[str]):
     memory_blob = "\n".join(f"- {m}" for m in recalled) if recalled else "(none)"
-    kb_blob = ""
-    if rag_context:
-        kb_blob = (
-            "\n\n[Knowledge Base Context]\n"
-            f"{rag_context}\n\n"
-            "When the user's question can be answered from the context above, "
-            "answer directly from it and include short bracket citations like [1], [2] "
-            "matching the numbered items in that context. If it is not relevant, proceed normally."
-        )
-    sys = SystemMessage(content=SYSTEM_PROMPT + f"\n\n[Recalled user memories]\n{memory_blob}\n" + kb_blob)
+    sys = SystemMessage(content=SYSTEM_PROMPT + f"\n\n[Recalled user memories]\n{memory_blob}")
     user = HumanMessage(content=req.message)
     return [sys, user]
-
-@app.post("/rag/upload", response_model=RAGUploadResponse)
-async def rag_upload(
-    file: UploadFile = File(...),
-    collection: str = Form(None),
-):
-    """
-    Upload a single PDF, chunk+embed, and upsert into Milvus.
-    """
-    _require_rag_env()
-    coll = (collection or RAG_COLLECTION_DEFAULT).strip()
-    data = await file.read()
-    inserted = rag_upsert_pdf(data, file.filename, coll)
-    return {"ok": True, "inserted": inserted, "collection": coll}
-
-@app.post("/rag/query", response_model=ChatResponse)
-async def rag_query(q: RAGQuery):
-    """
-    Ask a question against a collection; uses the same LLM for final answer.
-    """
-    coll = (q.collection or RAG_COLLECTION_DEFAULT).strip()
-    result = rag_answer_with_llm(q.question, coll, k=q.k)
-    # Store light memory of the turn (optional)
-    memory_add("default", "user", f"[RAG] {q.question}")
-    memory_add("default", "assistant", result["answer"])
-    return ChatResponse(response=result["answer"], attachments=[{"type": "table", "rows": result["sources"], "columns": ["rank","source","page","chars"], "caption": "Top matches"}])
-
-# ===== Add this helper somewhere above chat_endpoint =====
-def _rag_context_and_sources(question: str, collection_name: str, k: int = 4):
-    """
-    Try to fetch relevant chunks for the question.
-    Returns (context_str, sources_list). If RAG not configured or no hits, returns ("", []).
-    """
-    try:
-        docs = rag_search(question, collection_name, k=k)
-    except Exception:
-        return "", []
-
-    if not docs:
-        return "", []
-
-    context = _format_context(docs)
-    sources = []
-    for i, d in enumerate(docs, 1):
-        meta = d.metadata or {}
-        sources.append({
-            "rank": i,
-            "source": meta.get("source"),
-            "page": meta.get("page", meta.get("page_number")),
-            "chars": len(d.page_content or ""),
-        })
-    return context, sources
-
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat_endpoint(request: ChatRequest):
     msg = (request.message or "").strip()
 
-    # ---- 1) "doc:" short-circuit remains ----
-    if msg.lower().startswith("doc:"):
-        q = msg[4:].strip()
-        coll = RAG_COLLECTION_DEFAULT
-        result = rag_answer_with_llm(q, coll, k=4)
-        memory_add(request.session_id or "default", "user", f"[RAG] {q}")
-        memory_add(request.session_id or "default", "assistant", result["answer"])
-        return ChatResponse(
-            response=result["answer"],
-            attachments=[{"type": "table", "rows": result["sources"], "columns": ["rank","source","page","chars"], "caption": "Top matches"}]
-        )
-
-    # ---- 2) recall memory + pending publish flow (unchanged) ----
+    # ---- Recall memory + pending publish flow ----
     recalled = memory_search(request.session_id or "default", request.message, k=5)
     session_id = request.session_id or "default"
     pending = get_pending(session_id)
@@ -597,19 +383,16 @@ async def chat_endpoint(request: ChatRequest):
             memory_add(session_id, "assistant", ask)
             return {"response": ask, "attachments": []}
 
-    # ---- 3) NEW: try to pull RAG context automatically ----
-    rag_context, rag_sources = _rag_context_and_sources(msg, RAG_COLLECTION_DEFAULT, k=4)
-
-    # ---- 4) build messages (now include RAG context when present) ----
+    # ---- Build messages ----
     llm_with_tools = llm.bind_tools(TOOLS)
-    msgs = _build_messages(request, recalled, rag_context=rag_context)
+    msgs = _build_messages(request, recalled)
 
     ai_first: AIMessage = llm_with_tools.invoke(msgs)
 
     tool_steps: List[Dict[str, Any]] = []
     final_text = ai_first.content or ""
 
-    # ---- 5) tool calling loop (unchanged) ----
+    # ---- Tool calling loop ----
     if getattr(ai_first, "tool_calls", None):
         tool_msgs: List[ToolMessage] = []
         for tc in ai_first.tool_calls:
@@ -647,15 +430,8 @@ async def chat_endpoint(request: ChatRequest):
         ai_final: AIMessage = llm_with_tools.invoke(msgs + [ai_first] + tool_msgs)
         final_text = ai_final.content or final_text
 
-    # ---- 6) Build attachments: tool outputs + (NEW) RAG sources ----
+    # ---- Build attachments from tool outputs ----
     attachments = _extract_attachments(tool_steps)
-    if rag_sources:
-        attachments.append({
-            "type": "table",
-            "rows": rag_sources,
-            "columns": ["rank","source","page","chars"],
-            "caption": "Top matches (RAG)"
-        })
 
     output_text = _clean_output_text(final_text, attachments)
 
@@ -664,7 +440,7 @@ async def chat_endpoint(request: ChatRequest):
 
     return {"response": output_text, "attachments": attachments}
 
-# -------- Direct REST endpoints (unchanged) --------
+# -------- Direct REST endpoints --------
 @app.get("/views/image")
 def get_view_image(view_name: str, workbook_name: str = "", filters_json: str = ""):
     payload = {"view_name": view_name, "workbook_name": workbook_name, "filters_json": filters_json}
@@ -678,4 +454,3 @@ def get_view_data(view_name: str, workbook_name: str = "", filters_json: str = "
 @app.post("/datasources/publish-mock")
 def api_publish_mock():
     return {"message": publish_mock_datasource.invoke({})}
-
