@@ -1,21 +1,14 @@
-"""
-main.py — Tableau Chatbot Agent (LangMem + user-tail) — schema-free memory
-- No predefined fields; remembers any user-stated info.
-- Recall = LangMem semantic hits + last-N user utterances (dedup).
-- CSV export for any table result (file attachment).
-"""
-
 import json
 import os
 import re
 import csv
 import uuid
 import logging
-from typing import List, Dict, Any, Optional, Tuple
-
+from typing import List, Dict, Any, Optional
+from enum import Enum
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel,Field,field_validator
 from dotenv import load_dotenv
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage
 
@@ -103,6 +96,7 @@ def make_llm():
 
 llm = make_llm()
 
+
 # ---------------- Tools wiring ----------------
 TOOLS = [
     list_tableau_projects,
@@ -129,35 +123,133 @@ def clear_pending(session_id: str) -> None:
         log.debug("Clear pending intent: session=%s", session_id)
         del PENDING[session_id]
 
-# ---- Parse publish details from free text or JSON ----
-_P_KV = re.compile(r'(?:\bproject(?:_name)?\b)\s*[:=]\s*["\']?([^,\n;]+?)["\']?(?=,|;|\s|$)', re.I)
-_D_KV = re.compile(r'(?:\bdatasource(?:_name)?\b|data\s*source)\s*[:=]\s*["\']?([^,\n;]+?)["\']?(?=,|;|\s|$)', re.I)
-_OW_KV = re.compile(r'\boverwrite\b\s*[:=]\s*(true|false|yes|no|y|n|1|0)', re.I)
+# ---------------- LLM intent & slot schema ----------------
+class Intent(str, Enum):
+    VIEW_IMAGE = "view_image"               # show a Tableau view image
+    VIEW_DATA = "view_data"                 # analyze/export data from a Tableau view
+    PUBLISH_MOCK = "publish_mock_datasource"
+    MEMORY_QA = "memory_qa"                 # "what's my ...", "do you remember ..."
+    HELP = "help"                           # "what can you do", "help"
+    SMALLTALK = "smalltalk"                 # chit-chat
+    UNKNOWN = "unknown"
 
-def _to_bool(val: Any) -> Optional[bool]:
-    if isinstance(val, bool): return val
-    s = str(val).strip().lower()
-    if s in ("true", "yes", "y", "1"): return True
-    if s in ("false", "no", "n", "0"): return False
-    return None
+class PublishArgs(BaseModel):
+    project_name: Optional[str] = None
+    datasource_name: Optional[str] = None
+    overwrite: Optional[bool] = None
 
-def parse_publish_details(text: str) -> Tuple[Optional[str], Optional[str], Optional[bool]]:
-    project_name = None; datasource_name = None; overwrite = None
+class ParsedCommand(BaseModel):
+    intent: Intent = Field(..., description="Best intent for this user message.")
+    # tableau view access
+    view_name: Optional[str] = None
+    workbook_name: Optional[str] = None
+    filters_json: Optional[Dict[str, Any]] = None   
+    # Accept '{"k":"v"}' as well as dict, and coerce to dict.
+    @field_validator("filters_json", mode="before")
+    @classmethod
+    def _filters_json_coerce(cls, v):
+        if v is None:
+            return None
+        if isinstance(v, (dict,)):
+            return v
+        if isinstance(v, str):
+            s = v.strip()
+            if not s:
+                return None
+            try:
+                obj = json.loads(s)
+                return obj if isinstance(obj, dict) else None
+            except Exception:
+                return None
+        return None
+    publish: Optional[PublishArgs] = None
+    # memory
+    is_specific_memory_question: Optional[bool] = False
+    # misc
+    reason: str = Field(..., description="Short rationale of why this intent/slots were chosen.")
+
+def _llm_parse_user_utterance(user_text: str, recalled_snippets: List[str]) -> ParsedCommand:
+    """
+    Prompt-based router+slot extractor that returns a ParsedCommand via structured output.
+    Uses whatever LLM you've already configured in `make_llm()`.
+    """
+    # Couple of concrete, terse, stable instructions for the model
+    sys = SystemMessage(content=(
+        "You are a deterministic command router for a Tableau assistant. "
+        "Classify the user's intent and extract arguments into a strict schema. "
+        "If filters are mentioned (e.g., Region=APAC 2024), normalize them into filters_json. "
+        "If the user is asking you to remember/recall personal facts ('what is my...'), set intent=MEMORY_QA. "
+        "If the user wants to PUBLISH a mock datasource, fill publish.project_name/datasource_name/overwrite when present. "
+        "Prefer concrete values from the user text; do not hallucinate."
+        "You are a deterministic command router for a Tableau assistant.\n"
+        "- Map verbs:\n"
+        "  * SEE/visualize verbs → intent=VIEW_IMAGE (e.g., 'show', 'display', 'render', 'image', 'screenshot', 'see', 'preview').\n"
+        "  * DATA/analysis verbs → intent=VIEW_DATA (e.g., 'csv', 'data', 'table', 'rows', 'export', 'download', 'analyze', 'analysis').\n"
+        "  * If both appear, DATA wins (csv/export beats show).\n"
+        "- Extract arguments into the strict schema. If filters are mentioned (e.g., Region=APAC, Year=2024), normalize into filters_json.\n"
+        "- If the user is asking to remember/recall personal facts ('what is my ...'), set intent=MEMORY_QA.\n"
+        "- If the user wants to PUBLISH a mock datasource, fill publish.project_name/datasource_name/overwrite when present.\n"
+        "- Prefer concrete values from the user text; do not hallucinate."
+     ))
+
+    # Keep the message short; provide a small slice of recalled context to help with references like 'same as before'
+    snippet_block = ""
+    if recalled_snippets:
+        top = recalled_snippets[:6]
+        snippet_block = "Relevant snippets:\n- " + "\n- ".join(top) + "\n"
+
+    # Ask for structured output using Pydantic
+    structured_llm = llm.with_structured_output(ParsedCommand)
+    hm = HumanMessage(content=(
+        f"{snippet_block}"
+        "Return ONLY fields defined by the schema; avoid made-up keys.\n\n"
+        f"User message:\n{user_text}"
+    ))
     try:
-        obj = json.loads(text)
-        if isinstance(obj, dict):
-            project_name = obj.get("project") or obj.get("project_name") or project_name
-            datasource_name = obj.get("datasource") or obj.get("datasource_name") or datasource_name
-            if "overwrite" in obj: overwrite = _to_bool(obj.get("overwrite"))
-    except Exception:
-        pass
-    if not project_name:
-        m = _P_KV.search(text);  project_name = m.group(1).strip() if m else project_name
-    if not datasource_name:
-        m = _D_KV.search(text);  datasource_name = m.group(1).strip() if m else datasource_name
-    if overwrite is None:
-        m = _OW_KV.search(text); overwrite = _to_bool(m.group(1)) if m else None
-    return project_name, datasource_name, overwrite
+        parsed: ParsedCommand = structured_llm.invoke([sys, hm])
+        text_l = (user_text or "").lower()
+        see_words = ("show", "display", "render", "image", "screenshot", "see", "preview")
+        data_words = ("csv", "data", "table", "rows", "export", "download", "analyze", "analysis", "analytics")
+        if parsed.intent in (Intent.UNKNOWN, Intent.VIEW_IMAGE, Intent.VIEW_DATA):
+            if any(w in text_l for w in data_words):
+                parsed.intent = Intent.VIEW_DATA
+            elif any(w in text_l for w in see_words):
+                parsed.intent = Intent.VIEW_IMAGE
+        if isinstance(parsed.filters_json, str):
+            try:
+                fj = json.loads(parsed.filters_json)
+                parsed.filters_json = fj if isinstance(fj, dict) else None
+            except Exception:
+                parsed.filters_json = None
+        return parsed
+    except Exception as e:
+        log.warning("LLM parse failed, falling back to UNKNOWN: %s", e, exc_info=True)
+        return ParsedCommand(intent=Intent.UNKNOWN, reason="LLM parse error")
+
+
+# ---- Parse publish details from free text or JSON ----
+
+SAVE_INTENT_RE = re.compile(r"\b(remember|save|note|store)\b", re.I)
+
+def maybe_pin_fact(session_id: str, text: str):
+    """
+    If the user says 'remember/save/note/store ...', write a second, clearer
+    schema-free memory line in LangMem to make retrieval easier, e.g.:
+        [FACT] my favorite color is teal
+    """
+    if not text or not SAVE_INTENT_RE.search(text):
+        return
+    # Strip leading command words like "remember that", "save that", etc.
+    m = re.match(r'^\s*(?:please\s+)?(?:remember|save|note|store)\s+(?:that\s+)?(.+)$', text, re.I)
+    fact = (m.group(1) if m else text).strip()
+    if fact:
+        try:
+            LANGMEM.add(session_id, f"[FACT] {fact}")
+            log.debug("Pinned fact to LangMem: %s", _truncate(fact))
+        except Exception as e:
+            log.warning("Failed to pin fact: %s", e)
+
+
 
 def ask_for_publish_names_hint() -> str:
     return (
@@ -172,6 +264,8 @@ SYSTEM_PROMPT = """You are a helpful Tableau assistant named Alex.
 
 - If the user wants to SEE a chart, call `tableau_get_view_image`.
 - If the user wants to ANALYZE a chart/table, call `tableau_get_view_data`, then answer from those rows.
+- If the user wants to list all the views in a specific workbook (e.g., "List all views in Superstore"), call `list_tableau_views` with the workbook name.
+- If the user says 'show', 'display', 'render', 'see', 'preview', or 'screenshot', you MUST use `tableau_get_view_image` (never the CSV endpoint) unless they also explicitly say 'csv', 'table', 'rows', 'export', or 'analyze'. In that case use `tableau_get_view_data`.
 - Prefer using a tool over guessing. If filters are mentioned (e.g., Region=APAC, Year=2024), pass them as JSON to filters_json.
 - Do NOT print raw data URLs or base64 in your final answer.
 - When you fetch an image, just acknowledge it briefly; the UI will display it.
@@ -196,9 +290,10 @@ def _truncate(s: str, n: int = 200) -> str:
 
 # Tunables (override via env)
 USER_TAIL_MAX = int(os.getenv("USER_TAIL_MAX", "600"))
-RECALL_SEM_K = int(os.getenv("RECALL_SEM_K", "12"))
-RECALL_TAIL_K = int(os.getenv("RECALL_TAIL_K", "12"))
-RECALL_TOTAL_K = int(os.getenv("RECALL_TOTAL_K", "24"))
+RECALL_SEM_K = int(os.getenv("RECALL_SEM_K", "24"))
+RECALL_TAIL_K = int(os.getenv("RECALL_TAIL_K", "24"))
+RECALL_TOTAL_K = int(os.getenv("RECALL_TOTAL_K", "32"))
+MEMORY_Q_TAIL_K = int(os.getenv("MEMORY_Q_TAIL_K", "64")) 
 
 class UserTailMemory:
     """User-only recency tail per session (keeps just user utterances)."""
@@ -236,13 +331,19 @@ class LangMemWrapper:
             embedder = GoogleGenerativeAIEmbeddings(
                 model=gem_model, google_api_key=os.getenv("GOOGLE_API_KEY")
             )
-            def _embed(texts): return embedder.embed_documents(list(texts))
+            def _to_list(x):
+                if isinstance(x, str):
+                    return [x]
+                try:
+                    return [str(t) for t in list(x)]
+                except TypeError:
+                    return [str(x)]
+
+            def _embed(texts):
+                items = _to_list(texts)
+                return embedder.embed_documents(items)
+
             self.store = InMemoryStore(index={"dims": dims, "embed": _embed})
-            self.manager = create_memory_store_manager(
-                model, namespace=("memories", "{langgraph_user_id}"), store=self.store, query_limit=5
-            )
-            self.available = True
-            log.info("LangMem initialized: model=%s dims=%s", gem_model, dims)
         except Exception as e:
             log.error("Failed to initialize LangMem: %s", e, exc_info=True)
             self.available = False
@@ -316,9 +417,18 @@ def memory_recall(session_id: str, query: str) -> List[str]:
 
 # ---------------- Schema-free semantic memory QA ----------------
 MEMORY_Q_RE = re.compile(
-    r"\b(what\s+is\s+my\b|do\s+you\s+remember\b|what\s+did\s+i\s+say\b|remind\s+me\s+what\b)",
+    r"\b("
+    r"what\s+(?:is|was|are)\s+(?:my|our)\b|"
+    r"what'?s\s+(?:my|our)\b|"
+    r"do\s+you\s+remember\b|"
+    r"what\s+did\s+i\s+say\b|"
+    r"remind\s+me\s+what\b|"
+    r"what\s+did\s+i\s+tell\s+you\b|"
+    r"recall\s+(?:my|our)\b"
+    r")",
     re.I,
 )
+
 
 def gather_memory_snippets(session_id: str, query: str, extra_k: int = 10) -> List[str]:
     """
@@ -340,16 +450,22 @@ def gather_memory_snippets(session_id: str, query: str, extra_k: int = 10) -> Li
             if h and h not in seen:
                 out.append(h); seen.add(h)
     # recency tail
-    for t in USER_TAIL.last_n(session_id, n=8):
+    for t in USER_TAIL.last_n(session_id, n=MEMORY_Q_TAIL_K):
         if t and t not in seen:
             out.append(t); seen.add(t)
     return out[:24]
 
+def _supported_by_snippets(ans: str, snippets: List[str]) -> bool:
+    if not ans: return False
+    al = ans.lower()
+    # Require that at least one meaningful chunk of the answer appears in a snippet.
+    # Split on punctuation/commas to find a short phrase to check.
+    parts = [p.strip() for p in re.split(r"[.;,\n]", ans) if p.strip()]
+    haystack = "\n".join(snippets).lower()
+    # If any non-trivial part (>= 3 chars) is found verbatim in snippets, we accept.
+    return any((len(p) >= 3 and p.lower() in haystack) for p in parts)
+
 def try_semantic_memory_answer(session_id: str, user_text: str) -> Optional[str]:
-    """
-    If the user is asking about their own info, answer purely from LangMem snippets.
-    Returns a short answer or None to fall back to normal flow.
-    """
     if not MEMORY_Q_RE.search(user_text or ""):
         return None
 
@@ -365,8 +481,10 @@ def try_semantic_memory_answer(session_id: str, user_text: str) -> Optional[str]
     resp: AIMessage = llm.invoke([SystemMessage(content="Be concise. Use only given snippets."),
                                   HumanMessage(content=guide)])
     ans = (resp.content or "").strip()
-    if not ans or ans.upper().startswith("INSUFFICIENT"):
+    if (not ans) or ans.upper().startswith("INSUFFICIENT") or not _supported_by_snippets(ans, snippets):
         return "I couldn’t find that in our past messages. Tell me now and I’ll remember."
+    if re.match(r"\s*my\b", ans, re.IGNORECASE):
+        return re.sub(r"^\s*my\b", "Your", ans, flags=re.IGNORECASE)
     return ans
 
 # ---------------- Cleaning / attachments ----------------
@@ -374,6 +492,13 @@ JSON_CODEBLOCK_RE = re.compile(r"```(?:json|csv|table)?[\s\S]*?```", re.IGNORECA
 
 def _clean_output_text(text: str, attachments) -> str:
     if not isinstance(text, str): return ""
+    if text.strip().startswith("{") and text.strip().endswith("}"):
+        try:
+            _obj = json.loads(text)
+            if isinstance(_obj, dict) and "text" in _obj and isinstance(_obj["text"], str):
+                text = _obj["text"]
+        except Exception:
+            pass
     text = text.replace("Final Answer:", "").strip()
     text = re.sub(r'data:image\/[a-zA-Z]+;base64,[A-Za-z0-9+/=\s]+', '', text).strip()
     text = JSON_CODEBLOCK_RE.sub("", text).strip()
@@ -486,11 +611,64 @@ async def chat_endpoint(request: ChatRequest):
     log.info("POST /chat session=%s msg=%s", session_id, _truncate(request.message, 300))
 
     # --- 0) Schema-free memory Q&A (LangMem-only) ---
-    mem_ans = try_semantic_memory_answer(session_id, request.message or "")
-    if mem_ans is not None:
-        memory_add(session_id, "user", request.message)
-        memory_add(session_id, "assistant", mem_ans)
-        return {"response": mem_ans, "attachments": []}
+    maybe_pin_fact(session_id, request.message or "")
+    primary_recall = memory_recall(session_id, request.message)
+    extra_recall = gather_memory_snippets(session_id, request.message, extra_k=6)
+    # merged recalled
+    seen = set(); recalled = []
+    for s in primary_recall + extra_recall:
+        if s not in seen:
+            recalled.append(s); seen.add(s)
+
+    parsed = _llm_parse_user_utterance(request.message or "", recalled)
+
+    if parsed.intent in (Intent.VIEW_IMAGE, Intent.VIEW_DATA):
+        tool_name = "tableau_get_view_image" if parsed.intent == Intent.VIEW_IMAGE else "tableau_get_view_data"
+        args = {
+            "view_name": parsed.view_name or "",
+            "workbook_name": parsed.workbook_name or "",
+            "filters_json": json.dumps(parsed.filters_json or {}),
+        }
+        if not args["view_name"]:
+            pass
+        else:
+            try:
+                result = TOOL_REGISTRY[tool_name].invoke(args)
+            except Exception as e:
+                result = f"Tool '{tool_name}' failed: {e}"
+                log.error(result, exc_info=True)
+            attachments = _extract_attachments([{"name": tool_name, "args": args, "result": result}])
+            output_text = _clean_output_text(str(result), attachments)
+            memory_add(session_id, "user", request.message)
+            memory_add(session_id, "assistant", output_text)
+            return {"response": output_text, "attachments": attachments}
+
+    elif parsed.intent == Intent.PUBLISH_MOCK:
+        pub = parsed.publish or PublishArgs()
+        if pub.project_name and pub.datasource_name:
+            args = {"project_name": pub.project_name, "datasource_name": pub.datasource_name}
+            if pub.overwrite is not None: args["overwrite"] = bool(pub.overwrite)
+            try:
+                result = publish_mock_datasource.invoke(args)
+            except Exception as e:
+                result = f"Tool 'publish_mock_datasource' failed: {e}"
+                log.error(result, exc_info=True)
+            attachments = _extract_attachments([{"name": "publish_mock_datasource", "args": args, "result": result}])
+            output_text = _clean_output_text(str(result), attachments)
+            memory_add(session_id, "user", request.message)
+            memory_add(session_id, "assistant", output_text)
+            return {"response": output_text, "attachments": attachments}
+        else:
+            set_pending(session_id, "publish_mock_datasource")
+            ask = ask_for_publish_names_hint()
+            memory_add(session_id, "assistant", ask)
+            return {"response": ask, "attachments": []}
+    if parsed.intent == Intent.MEMORY_QA:
+        mem_ans = try_semantic_memory_answer(session_id, request.message or "")
+        if mem_ans is not None:
+            memory_add(session_id, "user", request.message)
+            memory_add(session_id, "assistant", mem_ans)
+            return {"response": mem_ans, "attachments": []}
 
     # --- 1) recall (richer, schema-free) ---
     primary_recall = memory_recall(session_id, request.message)
@@ -503,11 +681,15 @@ async def chat_endpoint(request: ChatRequest):
 
     pending = get_pending(session_id)
     if pending and pending.get("intent") == "publish_mock_datasource":
-        pn, dn, ow = parse_publish_details(request.message)
-        log.debug("Pending publish: parsed pn=%s dn=%s ow=%s", pn, dn, ow)
+        # Re-parse current message for publish slots
+        parsed_now = _llm_parse_user_utterance(request.message or "", recalled)
+        pub = (parsed_now.publish or PublishArgs())
+        pn, dn, ow = pub.project_name, pub.datasource_name, pub.overwrite
+        log.debug("Pending publish (LLM): pn=%s dn=%s ow=%s", pn, dn, ow)
+
         if pn and dn:
             args = {"project_name": pn, "datasource_name": dn}
-            if ow is not None: args["overwrite"] = ow
+            if ow is not None: args["overwrite"] = bool(ow)
             try:
                 result = publish_mock_datasource.invoke(args)
             except Exception as e:
@@ -518,13 +700,15 @@ async def chat_endpoint(request: ChatRequest):
             output_text = _clean_output_text(f"{result}", attachments)
             memory_add(session_id, "user", request.message)
             memory_add(session_id, "assistant", output_text)
-            log.info("Publish flow complete: %s", _truncate(output_text))
+            log.info("Publish flow complete.")
             return {"response": output_text, "attachments": attachments}
         else:
             ask = ask_for_publish_names_hint()
+            memory_add(session_id, "user", request.message)
             memory_add(session_id, "assistant", ask)
-            log.info("Publish flow: asking for names.")
+            log.info("Publish flow: asking for names (LLM).")
             return {"response": ask, "attachments": []}
+
 
     # --- 2) LLM call: decide tool calls ---
     llm_with_tools = llm.bind_tools(TOOLS)
@@ -546,19 +730,37 @@ async def chat_endpoint(request: ChatRequest):
                 log.warning("Unknown tool requested: %s", name); continue
 
             if name == "publish_mock_datasource":
-                user_pn, user_dn, user_ow = parse_publish_details(request.message)
-                pn = args.get("project_name") or user_pn
-                dn = args.get("datasource_name") or user_dn
+                pub = parsed.publish or PublishArgs()
+                pn = args.get("project_name") or pub.project_name
+                dn = args.get("datasource_name") or pub.datasource_name
                 ow = args.get("overwrite")
-                if ow is None and user_ow is not None: ow = user_ow
+                if ow is None and pub.overwrite is not None:
+                    ow = pub.overwrite
+
+                # Guard against placeholder/defaults and missing names
                 if not pn or not dn or pn == "AI Demos" or dn == "AI_Sample_Sales":
                     set_pending(session_id, "publish_mock_datasource")
                     ask = ask_for_publish_names_hint()
                     memory_add(session_id, "assistant", ask)
-                    log.info("Blocked publish due to missing/placeholder names.")
+                    log.info("Blocked publish due to missing/placeholder names (LLM parse).")
                     return {"response": ask, "attachments": []}
+
                 args = {"project_name": pn, "datasource_name": dn}
-                if ow is not None: args["overwrite"] = bool(ow)
+                if ow is not None:
+                    args["overwrite"] = bool(ow)
+
+            elif name in ("tableau_get_view_image", "tableau_get_view_data"):
+                # Pre-fill slots for view tools
+                if parsed.view_name and not args.get("view_name"):
+                    args["view_name"] = parsed.view_name
+                if parsed.workbook_name and not args.get("workbook_name"):
+                    args["workbook_name"] = parsed.workbook_name
+                if parsed.filters_json and not args.get("filters_json"):
+                    try:
+                        # ensure it's JSON string since your tool expects str
+                        args["filters_json"] = json.dumps(parsed.filters_json)
+                    except Exception:
+                        pass
 
             try:
                 result = tool.invoke(args)
@@ -575,6 +777,24 @@ async def chat_endpoint(request: ChatRequest):
 
     # --- 4) attachments + output cleanup ---
     attachments = _extract_attachments(tool_steps)
+    if not (final_text or "").strip() and tool_steps:
+        # Use the tools' textual results when the model is silent
+        for step in tool_steps:
+            res = step.get("result")
+            if not res:
+                continue
+            s = str(res)
+            if s.strip().startswith("{") and s.strip().endswith("}"):
+                try:
+                    obj = json.loads(s)
+                    if isinstance(obj, dict) and isinstance(obj.get("text"), str):
+                        final_text = obj["text"]
+                        break
+                except Exception:
+                    pass
+            if s.strip():
+                final_text = s
+                break
     output_text = _clean_output_text(final_text, attachments)
     log.info("Final output length=%d (attachments=%d)", len(output_text or ""), len(attachments))
 
