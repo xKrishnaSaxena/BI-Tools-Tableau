@@ -78,6 +78,70 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+def _boolish(x):
+    if isinstance(x, bool): return x
+    if x is None: return None
+    s = str(x).strip().lower()
+    if s in ("1","true","yes","y","on"): return True
+    if s in ("0","false","no","n","off"): return False
+    return None
+
+def _unquote(s: str) -> str:
+    return s.strip().strip('\'"')
+
+def _parse_publish_from_text(text: str):
+    """
+    Return (project_name, datasource_name, overwrite_or_None) or (None, None, None)
+    Accepts JSON and loose 'key=value' or 'key: value' pairs in any order.
+    Keys accepted: project|project_name, datasource|datasource_name|data_source|ds|source, overwrite
+    """
+    if not text:
+        return None, None, None
+    s = text.strip()
+
+    # Try JSON first
+    try:
+        obj = json.loads(s)
+        if isinstance(obj, dict):
+            pn = obj.get("project") or obj.get("project_name")
+            dn = (obj.get("datasource") or obj.get("datasource_name")
+                  or obj.get("data_source") or obj.get("ds") or obj.get("source"))
+            ow = _boolish(obj.get("overwrite"))
+            return (_unquote(pn) if pn else None,
+                    _unquote(dn) if dn else None,
+                    ow)
+    except Exception:
+        pass
+
+    # Key/value pairs (comma/newline/space separated)
+    # e.g. "project=Team Analytics, datasource=Sandbox_Sales, overwrite=true"
+    kv = {}
+    parts = re.split(r'[,\n]+', s)
+    for p in parts:
+        m = re.search(r'^\s*([a-zA-Z _-]+)\s*[:=]\s*(.+?)\s*$', p.strip())
+        if not m:
+            # also allow "project X", "datasource Y"
+            m2 = re.search(r'^\s*([a-zA-Z _-]+)\s+(.+?)\s*$', p.strip())
+            if not m2:
+                continue
+            key, val = m2.group(1), m2.group(2)
+        else:
+            key, val = m.group(1), m.group(2)
+
+        k = key.strip().lower().replace(" ", "").replace("-", "")
+        v = _unquote(val.rstrip(","))
+        kv[k] = v
+
+    pn = kv.get("project") or kv.get("projectname")
+    dn = (kv.get("datasource") or kv.get("datasourcename")
+          or kv.get("datasource_name") or kv.get("datasource")  # redundancy ok
+          or kv.get("datasource") or kv.get("datasource")
+          or kv.get("datasource") or kv.get("datasourcename")
+          or kv.get("datasource") or kv.get("data_source")
+          or kv.get("ds") or kv.get("source"))
+    ow = _boolish(kv.get("overwrite"))
+    return pn, dn, ow
+
 # ---------------- LLM selection ----------------
 def make_llm():
     if ChatGoogleGenerativeAI is not None and os.getenv("GOOGLE_API_KEY"):
@@ -254,9 +318,11 @@ def maybe_pin_fact(session_id: str, text: str):
 def ask_for_publish_names_hint() -> str:
     return (
         "Before I publish the mock datasource, what **project name** and **datasource name** should I use?"
-        "\nYou can reply in either format:\n"
+        "\nYou can reply in any of these formats:\n"
         "- `project=Team Analytics, datasource=Sandbox_Sales, overwrite=true`\n"
-        "- `{\"project\": \"Team Analytics\", \"datasource\": \"Sandbox_Sales\", \"overwrite\": false}`"
+        "- `{\"project\": \"Team Analytics\", \"datasource\": \"Sandbox_Sales\", \"overwrite\": false}`\n"
+        "- `project Team Analytics, datasource Sandbox_Sales`\n"
+        "- `Project is \"Team Analytics\"; Data Source is Sandbox_Sales`\n"
     )
 
 # ---------------- Prompt ----------------
@@ -645,9 +711,22 @@ async def chat_endpoint(request: ChatRequest):
 
     elif parsed.intent == Intent.PUBLISH_MOCK:
         pub = parsed.publish or PublishArgs()
-        if pub.project_name and pub.datasource_name:
-            args = {"project_name": pub.project_name, "datasource_name": pub.datasource_name}
-            if pub.overwrite is not None: args["overwrite"] = bool(pub.overwrite)
+        pn, dn, ow = pub.project_name, pub.datasource_name, pub.overwrite
+        if not (pn and dn):
+            pn2, dn2, ow2 = _parse_publish_from_text(request.message or "")
+            if pn2 and dn2:
+                pn, dn = pn2, dn2
+                if ow is None:
+                    ow = ow2
+
+        if pn and dn:
+            if pn == "AI Demos" or dn == "AI_Sample_Sales":
+                ask = ask_for_publish_names_hint()
+                memory_add(session_id, "assistant", ask)
+                return {"response": ask, "attachments": []}
+
+            args = {"project_name": pn, "datasource_name": dn}
+            if ow is not None: args["overwrite"] = bool(ow)
             try:
                 result = publish_mock_datasource.invoke(args)
             except Exception as e:
@@ -681,13 +760,24 @@ async def chat_endpoint(request: ChatRequest):
 
     pending = get_pending(session_id)
     if pending and pending.get("intent") == "publish_mock_datasource":
-        # Re-parse current message for publish slots
         parsed_now = _llm_parse_user_utterance(request.message or "", recalled)
         pub = (parsed_now.publish or PublishArgs())
         pn, dn, ow = pub.project_name, pub.datasource_name, pub.overwrite
-        log.debug("Pending publish (LLM): pn=%s dn=%s ow=%s", pn, dn, ow)
+        if not (pn and dn):
+            pn2, dn2, ow2 = _parse_publish_from_text(request.message or "")
+            if pn2 and dn2:
+                pn, dn = pn2, dn2
+                if ow is None:
+                    ow = ow2
 
         if pn and dn:
+            if pn == "AI Demos" or dn == "AI_Sample_Sales":
+                ask = ask_for_publish_names_hint()
+                memory_add(session_id, "user", request.message)
+                memory_add(session_id, "assistant", ask)
+                log.info("Publish flow: names looked like defaults; asking again.")
+                return {"response": ask, "attachments": []}
+
             args = {"project_name": pn, "datasource_name": dn}
             if ow is not None: args["overwrite"] = bool(ow)
             try:
@@ -695,6 +785,7 @@ async def chat_endpoint(request: ChatRequest):
             except Exception as e:
                 result = f"Tool 'publish_mock_datasource' failed: {e}"
                 log.error(result, exc_info=True)
+
             attachments = _extract_attachments([{"name": "publish_mock_datasource", "args": args, "result": result}])
             clear_pending(session_id)
             output_text = _clean_output_text(f"{result}", attachments)
@@ -702,12 +793,13 @@ async def chat_endpoint(request: ChatRequest):
             memory_add(session_id, "assistant", output_text)
             log.info("Publish flow complete.")
             return {"response": output_text, "attachments": attachments}
-        else:
-            ask = ask_for_publish_names_hint()
-            memory_add(session_id, "user", request.message)
-            memory_add(session_id, "assistant", ask)
-            log.info("Publish flow: asking for names (LLM).")
-            return {"response": ask, "attachments": []}
+
+        # Still not enough info → ask again
+        ask = ask_for_publish_names_hint()
+        memory_add(session_id, "user", request.message)
+        memory_add(session_id, "assistant", ask)
+        log.info("Publish flow: asking for names (robust parse still missing).")
+        return {"response": ask, "attachments": []}
 
 
     # --- 2) LLM call: decide tool calls ---
