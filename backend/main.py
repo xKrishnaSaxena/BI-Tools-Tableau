@@ -12,7 +12,7 @@ from pydantic import BaseModel,Field,field_validator
 from dotenv import load_dotenv
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage
 
-# ----------------- Logging -----------------
+# ----------------- Logging ---------------
 def _setup_logging():
     level = os.getenv("LOG_LEVEL", "DEBUG").upper()
     logging.basicConfig(
