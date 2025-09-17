@@ -82,8 +82,8 @@ app.add_middleware(
 def make_llm():
     if ChatGoogleGenerativeAI is not None and os.getenv("GOOGLE_API_KEY"):
         try:
-            log.info("Using Gemini chat model: gemini-2.5-flash-lite")
-            return ChatGoogleGenerativeAI(model="gemini-2.5-flash-lite", temperature=0)
+            log.info("Using Gemini chat model: gemini-2.0-flash-lite")
+            return ChatGoogleGenerativeAI(model="gemini-2.0-flash-lite", temperature=0)
         except Exception as e:
             log.error("Failed to init Gemini chat model: %s", e, exc_info=True)
     if ChatOpenAI is not None and os.getenv("OPENAI_API_KEY"):
@@ -108,20 +108,6 @@ TOOLS = [
 ]
 TOOL_REGISTRY = {t.name: t for t in TOOLS}
 
-# ---- Pending-intent (per-session) ----
-PENDING: Dict[str, Dict[str, Any]] = {}
-
-def get_pending(session_id: str) -> Optional[Dict[str, Any]]:
-    return PENDING.get(session_id)
-
-def set_pending(session_id: str, intent: str, data: Optional[Dict[str, Any]] = None) -> None:
-    log.debug("Set pending intent: session=%s intent=%s data=%s", session_id, intent, data)
-    PENDING[session_id] = {"intent": intent, "data": data or {}}
-
-def clear_pending(session_id: str) -> None:
-    if session_id in PENDING:
-        log.debug("Clear pending intent: session=%s", session_id)
-        del PENDING[session_id]
 
 # ---------------- LLM intent & slot schema ----------------
 class Intent(str, Enum):
@@ -248,16 +234,6 @@ def maybe_pin_fact(session_id: str, text: str):
             log.debug("Pinned fact to LangMem: %s", _truncate(fact))
         except Exception as e:
             log.warning("Failed to pin fact: %s", e)
-
-
-
-def ask_for_publish_names_hint() -> str:
-    return (
-        "Before I publish the mock datasource, what **project name** and **datasource name** should I use?"
-        "\nYou can reply in either format:\n"
-        "- `project=Team Analytics, datasource=Sandbox_Sales, overwrite=true`\n"
-        "- `{\"project\": \"Team Analytics\", \"datasource\": \"Sandbox_Sales\", \"overwrite\": false}`"
-    )
 
 # ---------------- Prompt ----------------
 SYSTEM_PROMPT = """You are a helpful Tableau assistant named Alex.
@@ -533,6 +509,21 @@ def _write_csv(rows: list, columns: list, prefix: str = "tableau_export") -> str
                 w.writerow(r)
     return fname
 
+def _parse_key_value_input(text: str) -> Dict[str, str]:
+    """Parse key=value pairs from user input"""
+    result = {}
+    patterns = [
+        r'(\w+)\s*=\s*["\']?([^"\',]+)["\']?',  # key=value
+        r'["\']?(\w+)["\']?\s*:\s*["\']?([^"\',]+)["\']?',  # "key": "value"
+    ]
+    
+    for pattern in patterns:
+        matches = re.findall(pattern, text)
+        for key, value in matches:
+            result[key.lower()] = value.strip()
+    
+    return result
+
 def _extract_attachments(tool_steps: List[Dict[str, Any]]):
     attachments = []
     for step in tool_steps:
@@ -647,7 +638,8 @@ async def chat_endpoint(request: ChatRequest):
         pub = parsed.publish or PublishArgs()
         if pub.project_name and pub.datasource_name:
             args = {"project_name": pub.project_name, "datasource_name": pub.datasource_name}
-            if pub.overwrite is not None: args["overwrite"] = bool(pub.overwrite)
+            if pub.overwrite is not None:
+                args["overwrite"] = bool(pub.overwrite)
             try:
                 result = publish_mock_datasource.invoke(args)
             except Exception as e:
@@ -658,17 +650,7 @@ async def chat_endpoint(request: ChatRequest):
             memory_add(session_id, "user", request.message)
             memory_add(session_id, "assistant", output_text)
             return {"response": output_text, "attachments": attachments}
-        else:
-            set_pending(session_id, "publish_mock_datasource")
-            ask = ask_for_publish_names_hint()
-            memory_add(session_id, "assistant", ask)
-            return {"response": ask, "attachments": []}
-    if parsed.intent == Intent.MEMORY_QA:
-        mem_ans = try_semantic_memory_answer(session_id, request.message or "")
-        if mem_ans is not None:
-            memory_add(session_id, "user", request.message)
-            memory_add(session_id, "assistant", mem_ans)
-            return {"response": mem_ans, "attachments": []}
+
 
     # --- 1) recall (richer, schema-free) ---
     primary_recall = memory_recall(session_id, request.message)
@@ -677,37 +659,7 @@ async def chat_endpoint(request: ChatRequest):
     for s in primary_recall + extra_recall:
         if s not in seen:
             recalled.append(s); seen.add(s)
-    facts_for_prompt: List[str] = []  # no pinning/schema; keep interface stable
-
-    pending = get_pending(session_id)
-    if pending and pending.get("intent") == "publish_mock_datasource":
-        # Re-parse current message for publish slots
-        parsed_now = _llm_parse_user_utterance(request.message or "", recalled)
-        pub = (parsed_now.publish or PublishArgs())
-        pn, dn, ow = pub.project_name, pub.datasource_name, pub.overwrite
-        log.debug("Pending publish (LLM): pn=%s dn=%s ow=%s", pn, dn, ow)
-
-        if pn and dn:
-            args = {"project_name": pn, "datasource_name": dn}
-            if ow is not None: args["overwrite"] = bool(ow)
-            try:
-                result = publish_mock_datasource.invoke(args)
-            except Exception as e:
-                result = f"Tool 'publish_mock_datasource' failed: {e}"
-                log.error(result, exc_info=True)
-            attachments = _extract_attachments([{"name": "publish_mock_datasource", "args": args, "result": result}])
-            clear_pending(session_id)
-            output_text = _clean_output_text(f"{result}", attachments)
-            memory_add(session_id, "user", request.message)
-            memory_add(session_id, "assistant", output_text)
-            log.info("Publish flow complete.")
-            return {"response": output_text, "attachments": attachments}
-        else:
-            ask = ask_for_publish_names_hint()
-            memory_add(session_id, "user", request.message)
-            memory_add(session_id, "assistant", ask)
-            log.info("Publish flow: asking for names (LLM).")
-            return {"response": ask, "attachments": []}
+    facts_for_prompt: List[str] = [] 
 
 
     # --- 2) LLM call: decide tool calls ---
@@ -736,19 +688,19 @@ async def chat_endpoint(request: ChatRequest):
                 ow = args.get("overwrite")
                 if ow is None and pub.overwrite is not None:
                     ow = pub.overwrite
-
-                # Guard against placeholder/defaults and missing names
-                if not pn or not dn or pn == "AI Demos" or dn == "AI_Sample_Sales":
-                    set_pending(session_id, "publish_mock_datasource")
-                    ask = ask_for_publish_names_hint()
-                    memory_add(session_id, "assistant", ask)
-                    log.info("Blocked publish due to missing/placeholder names (LLM parse).")
-                    return {"response": ask, "attachments": []}
+                if (not pn) or (not dn) or pn == "AI Demos" or dn == "AI_Sample_Sales":
+                    result = json.dumps({
+                        "error": "missing_parameters",
+                        "text": ("I need a non-default project_name and datasource_name to publish. "
+                                 "Example: project=Team Analytics, datasource=Sandbox_Sales, overwrite=true/false")
+                    })
+                    tool_steps.append({"name": name, "args": {"project_name": pn, "datasource_name": dn, "overwrite": ow}, "result": result})
+                    tool_msgs.append(ToolMessage(tool_call_id=tc["id"], name=name, content=result))
+                    continue
 
                 args = {"project_name": pn, "datasource_name": dn}
                 if ow is not None:
                     args["overwrite"] = bool(ow)
-
             elif name in ("tableau_get_view_image", "tableau_get_view_data"):
                 # Pre-fill slots for view tools
                 if parsed.view_name and not args.get("view_name"):
@@ -770,7 +722,23 @@ async def chat_endpoint(request: ChatRequest):
                 log.error(result, exc_info=True)
             tool_steps.append({"name": name, "args": args, "result": result})
             tool_msgs.append(ToolMessage(tool_call_id=tc["id"], name=name, content=result))
-
+        for step in tool_steps:
+            if step["name"] in ("list_tableau_projects", "list_tableau_workbooks", "list_tableau_views"):
+                direct_text = str(step.get("result", "")).strip()
+                # If a tool ever returns JSON with {"text": "..."} pull that out
+                if direct_text.startswith("{") and direct_text.endswith("}"):
+                    try:
+                        obj = json.loads(direct_text)
+                        if isinstance(obj, dict) and isinstance(obj.get("text"), str):
+                            direct_text = obj["text"]
+                    except Exception:
+                        pass
+                attachments = _extract_attachments([step])
+                output_text = _clean_output_text(direct_text, attachments)
+                log.info("Returning direct list result for %s", step["name"])
+                memory_add(session_id, "user", request.message)
+                memory_add(session_id, "assistant", output_text)
+                return {"response": output_text, "attachments": attachments}
         ai_final: AIMessage = llm_with_tools.invoke(msgs + [ai_first] + tool_msgs)
         final_text = ai_final.content or final_text
         log.debug("LLM final response length=%d", len(final_text or ""))
