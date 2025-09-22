@@ -7,6 +7,7 @@ import logging
 from typing import List, Dict, Any, Optional
 from enum import Enum
 from fastapi import FastAPI
+from collections import defaultdict
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel,Field,field_validator
 from dotenv import load_dotenv
@@ -107,7 +108,24 @@ TOOLS = [
     publish_mock_datasource,
 ]
 TOOL_REGISTRY = {t.name: t for t in TOOLS}
+DEFAULTS_BY_SESSION: Dict[str, Dict[str, Any]] = defaultdict(dict)
+class DefaultPrefs(BaseModel):
+    project_name: Optional[str] = None
+    datasource_name: Optional[str] = None
+    workbook_name: Optional[str] = None
+    view_name: Optional[str] = None
+    filters: Optional[Dict[str, Any]] = None
+class DefaultsActionType(str, Enum):
+    NONE = "none"
+    SET = "set_defaults"
+    APPLY = "apply_defaults"
+    CLEAR = "clear_defaults"
 
+class DefaultsAction(BaseModel):
+    action: DefaultsActionType = DefaultsActionType.NONE
+    defaults: Optional[DefaultPrefs] = None
+    reason: Optional[str] = None
+    missing_keys: Optional[List[str]] = None
 
 # ---------------- LLM intent & slot schema ----------------
 class Intent(str, Enum):
@@ -117,12 +135,22 @@ class Intent(str, Enum):
     MEMORY_QA = "memory_qa"                 # "what's my ...", "do you remember ..."
     HELP = "help"                           # "what can you do", "help"
     SMALLTALK = "smalltalk"                 # chit-chat
+    LIST_PROJECTS = "list_projects"          # NEW
+    LIST_WORKBOOKS = "list_workbooks"        # NEW
+    LIST_VIEWS = "list_views"                # NEW
     UNKNOWN = "unknown"
 
 class PublishArgs(BaseModel):
     project_name: Optional[str] = None
     datasource_name: Optional[str] = None
     overwrite: Optional[bool] = None
+
+class PostProcessAnswer(BaseModel):
+    answer: str
+    suggest_next_tool: bool = False
+    next_tool_name: Optional[str] = None
+    next_tool_args: Optional[Dict[str, Any]] = None
+    reason: Optional[str] = None
 
 class ParsedCommand(BaseModel):
     intent: Intent = Field(..., description="Best intent for this user message.")
@@ -153,6 +181,63 @@ class ParsedCommand(BaseModel):
     is_specific_memory_question: Optional[bool] = False
     # misc
     reason: str = Field(..., description="Short rationale of why this intent/slots were chosen.")
+def _merge_defaults(base: Dict[str, Any], new: Dict[str, Any]) -> Dict[str, Any]:
+    out = dict(base or {})
+    for k, v in (new or {}).items():
+        if k == "filters" and isinstance(v, dict):
+            out.setdefault("filters", {})
+            out["filters"].update(v)
+        elif v is not None:
+            out[k] = v
+    return out
+
+def _llm_infer_defaults_from_snippets(recalled: List[str]) -> Dict[str, Any]:
+    """
+    Look through prior snippets and infer CURRENT defaults.
+    Prefer the most recent snippet if contradictions exist.
+    Return only keys you can justify: project_name, datasource_name, workbook_name, view_name, filters (dict).
+    """
+    sys = SystemMessage(content=(
+        "From the following conversation snippets, infer the user's CURRENT defaults.\n"
+        "Only include fields you are confident about: project_name, datasource_name, workbook_name, view_name, filters (object).\n"
+        "Prefer the most recent information if there are conflicts. If nothing concrete, return an empty object."
+    ))
+    prompt = "Snippets (most recent last):\n- " + "\n- ".join(recalled or [])
+    try:
+        structured = llm.with_structured_output(DefaultPrefs)
+        prefs: DefaultPrefs = structured.invoke([sys, HumanMessage(content=prompt)])
+        return prefs.model_dump(exclude_none=True)
+    except Exception:
+        return {}
+
+def _llm_understand_defaults_command(user_text: str, recalled: List[str]) -> DefaultsAction:
+    """
+    Single LLM pass to decide whether this message:
+      - sets defaults (and which fields),
+      - applies defaults now,
+      - clears defaults,
+      - or none.
+    Also extract fields (DefaultPrefs) when setting.
+    """
+    sys = SystemMessage(content=(
+        "You are a precise interpreter for defaults management commands.\n"
+        "Classify the user's message into one of: set_defaults, apply_defaults, clear_defaults, none.\n"
+        "When setting, extract ONLY fields explicitly implied: project_name, datasource_name, workbook_name, view_name, filters (object).\n"
+        "For filters, prefer a JSON object with concrete key-value pairs. If ambiguous (e.g., just 'Furniture'), only set it if the likely key is obvious from context (e.g., Category). Otherwise, omit.\n"
+        "Never invent values; be conservative.\n"
+        "Use conversation snippets to understand references like 'use defaults', 'same as before', or previously stated default names.\n"
+    ))
+    memories = "\n".join(f"- {m}" for m in (recalled or []))
+    prompt = (
+        f"User message:\n{user_text}\n\n"
+        f"Relevant prior snippets (most recent last):\n{memories or '- (none)'}\n\n"
+        "Return structured output."
+    )
+    try:
+        structured = llm.with_structured_output(DefaultsAction)
+        return structured.invoke([sys, HumanMessage(content=prompt)])
+    except Exception:
+        return DefaultsAction(action=DefaultsActionType.NONE)
 
 def _llm_parse_user_utterance(user_text: str, recalled_snippets: List[str]) -> ParsedCommand:
     """
@@ -194,6 +279,13 @@ def _llm_parse_user_utterance(user_text: str, recalled_snippets: List[str]) -> P
     try:
         parsed: ParsedCommand = structured_llm.invoke([sys, hm])
         text_l = (user_text or "").lower()
+        if re.search(r"\blist|show|give me|what are\b", text_l):
+            if "project" in text_l:
+                parsed.intent = Intent.LIST_PROJECTS
+            elif "workbook" in text_l:
+                parsed.intent = Intent.LIST_WORKBOOKS
+            elif "view" in text_l:
+                parsed.intent = Intent.LIST_VIEWS
         see_words = ("show", "display", "render", "image", "screenshot", "see", "preview")
         data_words = ("csv", "data", "table", "rows", "export", "download", "analyze", "analysis", "analytics")
         if parsed.intent in (Intent.UNKNOWN, Intent.VIEW_IMAGE, Intent.VIEW_DATA):
@@ -211,6 +303,51 @@ def _llm_parse_user_utterance(user_text: str, recalled_snippets: List[str]) -> P
     except Exception as e:
         log.warning("LLM parse failed, falling back to UNKNOWN: %s", e, exc_info=True)
         return ParsedCommand(intent=Intent.UNKNOWN, reason="LLM parse error")
+
+def get_session_defaults(session_id: str, recalled: List[str]) -> Dict[str, Any]:
+    """
+    Compose defaults from:
+      1) in-memory saved values for this session, then
+      2) LLM-inferred defaults from prior snippets.
+    Explicitly stored dict wins over inferred.
+    """
+    stored = dict(DEFAULTS_BY_SESSION.get(session_id, {}))
+    inferred = _llm_infer_defaults_from_snippets(recalled)
+    return _merge_defaults(inferred, stored)  # stored > inferred
+
+def apply_defaults_to_parsed(
+    parsed: ParsedCommand,
+    defaults: Dict[str, Any],
+    apply_now: bool,
+) -> ParsedCommand:
+    """
+    If apply_now=True, fill all missing tool args from defaults.
+    If apply_now=False, still fill missing ONLY when safe (e.g., to avoid tool ask-backs).
+    Explicit user-provided fields always win.
+    """
+    # PUBLISH
+    if parsed.intent == Intent.PUBLISH_MOCK:
+        if parsed.publish:
+            if (apply_now or not parsed.publish.project_name) and defaults.get("project_name"):
+                parsed.publish.project_name = parsed.publish.project_name or defaults["project_name"]
+            if (apply_now or not parsed.publish.datasource_name) and defaults.get("datasource_name"):
+                parsed.publish.datasource_name = parsed.publish.datasource_name or defaults["datasource_name"]
+
+    # VIEW_* (image/data)
+    if parsed.intent in (Intent.VIEW_IMAGE, Intent.VIEW_DATA):
+        if (apply_now or not parsed.workbook_name) and defaults.get("workbook_name"):
+            parsed.workbook_name = parsed.workbook_name or defaults["workbook_name"]
+        if (apply_now or not parsed.view_name) and defaults.get("view_name"):
+            parsed.view_name = parsed.view_name or defaults["view_name"]
+
+        # Merge filters: defaults < explicit
+        f_defaults = defaults.get("filters") if isinstance(defaults.get("filters"), dict) else {}
+        f_explicit = parsed.filters_json or {}
+        merged = dict(f_defaults or {})
+        merged.update(f_explicit or {})
+        parsed.filters_json = merged or None
+
+    return parsed
 
 
 # ---- Parse publish details from free text or JSON ----
@@ -242,6 +379,7 @@ SYSTEM_PROMPT = """You are a helpful Tableau assistant named Alex.
 - If the user wants to ANALYZE a chart/table, call `tableau_get_view_data`, then answer from those rows.
 - If the user wants to list all the views in a specific workbook (e.g., "List all views in Superstore"), call `list_tableau_views` with the workbook name.
 - If the user says 'show', 'display', 'render', 'see', 'preview', or 'screenshot', you MUST use `tableau_get_view_image` (never the CSV endpoint) unless they also explicitly say 'csv', 'table', 'rows', 'export', or 'analyze'. In that case use `tableau_get_view_data`.
+- If the user says “use defaults”, apply any saved defaults (project/workbook/view/filters). If some default is missing, say exactly which one and how to set it.
 - Prefer using a tool over guessing. If filters are mentioned (e.g., Region=APAC, Year=2024), pass them as JSON to filters_json.
 - Do NOT print raw data URLs or base64 in your final answer.
 - When you fetch an image, just acknowledge it briefly; the UI will display it.
@@ -366,6 +504,89 @@ class LangMemWrapper:
 # Instantiate memory backends
 USER_TAIL = UserTailMemory()
 LANGMEM = LangMemWrapper(llm)
+def _summarize_tool_context(tool_steps: List[Dict[str, Any]], max_chars: int = 8000) -> str:
+    """
+    Create a compact, LLM-friendly view of tool calls/results.
+    Strips base64 blobs and keeps just the essence (lists, messages).
+    """
+    blobs = []
+    for step in tool_steps or []:
+        name = step.get("name", "")
+        args = step.get("args", {})
+        raw = step.get("result", "")
+        s = raw if isinstance(raw, str) else str(raw)
+        # Strip data URLs / big base64 images
+        s = DATA_URL_RE.sub("[image omitted]", s)
+        # Keep it compact
+        s = s.strip()
+        if len(s) > 2000:
+            s = s[:2000] + " …(truncated)"
+        blobs.append(f"- TOOL {name}\n  ARGS: {json.dumps(args, ensure_ascii=False)}\n  RESULT: {s}")
+    text = "\n".join(blobs)
+    return text[:max_chars]
+
+def _llm_post_process_answer(
+    user_text: str,
+    recalled: List[str],
+    tool_steps: List[Dict[str, Any]],
+    llm_obj=None,
+) -> Optional[str]:
+    """
+    Ask the LLM to ANSWER using only:
+      - user question
+      - recalled memories (LangMem + tail)
+      - tool outputs
+    The LLM is instructed to filter/reshape tool results (e.g., "projects with my name in them"),
+    but to never invent items not present in the tool output.
+    """
+    if not tool_steps:
+        return None
+
+    # Build a strict instruction set
+    sys = SystemMessage(content=(
+        "You are a cautious post-processor. "
+        "Use ONLY the provided tool outputs and the recalled user memories to answer the question. "
+        "If the user said 'my/our <something>', resolve it from the memory snippets. "
+        "If the answer requires filtering (e.g., 'projects with my name in it'), perform that filtering. "
+        "NEVER invent items that don't appear in a tool's RESULT. "
+        "If the info is insufficient, say so concisely and (optionally) suggest exactly ONE next tool call "
+        "with concrete args."
+    ))
+
+    memories = "\n".join(f"- {m}" for m in (recalled or []))
+    tools_ctx = _summarize_tool_context(tool_steps)
+
+    prompt = (
+        f"User question:\n{user_text}\n\n"
+        f"Recalled memory snippets (authoritative, may include the user's name/region/etc):\n{memories or '- (none)'}\n\n"
+        f"Tool calls and results (authoritative):\n{tools_ctx or '- (none)'}\n\n"
+        "TASK: Write the final answer for the user. "
+        "Rules:\n"
+        "- If possible, produce the exact subset/aggregation requested (e.g., filter list by user's name/region).\n"
+        "- Be concise and bullet the results when listing.\n"
+        "- Do not include any item not present in the tool results.\n"
+        "- If insufficient info, say so and suggest a precise next step (one tool and args).\n"
+    )
+
+    # Use structured output to keep things tidy
+    structured = (llm_obj or llm).with_structured_output(PostProcessAnswer)
+    try:
+        resp: PostProcessAnswer = structured.invoke([sys, HumanMessage(content=prompt)])
+    except Exception:
+        # Fallback to plain string if structured fails
+        raw = (llm_obj or llm).invoke([sys, HumanMessage(content=prompt)])
+        return (raw.content or "").strip()
+
+    text = (resp.answer or "").strip()
+    if not text:
+        return None
+
+    # Optionally, append a short "next step" suggestion (no auto-exec here)
+    if resp.suggest_next_tool and resp.next_tool_name:
+        tip = f"\n\nNext step: {resp.next_tool_name} with {json.dumps(resp.next_tool_args or {}, ensure_ascii=False)}"
+        text = text + tip
+
+    return text
 
 def memory_add(session_id: str, role: str, text: str):
     """Store every user utterance in LangMem + user-tail."""
@@ -612,6 +833,56 @@ async def chat_endpoint(request: ChatRequest):
             recalled.append(s); seen.add(s)
 
     parsed = _llm_parse_user_utterance(request.message or "", recalled)
+    defaults_cmd = _llm_understand_defaults_command(request.message or "", recalled)
+    if defaults_cmd.action == DefaultsActionType.SET and defaults_cmd.defaults:
+        vals = defaults_cmd.defaults.model_dump(exclude_none=True)
+        DEFAULTS_BY_SESSION[session_id] = _merge_defaults(DEFAULTS_BY_SESSION.get(session_id, {}), vals)
+        try:
+            LANGMEM.add(session_id, "[DEFAULTS] " + json.dumps(DEFAULTS_BY_SESSION[session_id]))
+        except Exception:
+            pass
+
+    # If the user wants to CLEAR defaults now, do it and acknowledge
+    if defaults_cmd.action == DefaultsActionType.CLEAR:
+        DEFAULTS_BY_SESSION.pop(session_id, None)
+        try:
+            LANGMEM.add(session_id, "[DEFAULTS] cleared")
+        except Exception:
+            pass
+        msg = "Okay — I cleared your saved defaults for this session."
+        memory_add(session_id, "user", request.message)
+        memory_add(session_id, "assistant", msg)
+        return {"response": msg, "attachments": []}
+
+    # Apply defaults (on request, or opportunistically for missing args)
+    apply_now = (defaults_cmd.action == DefaultsActionType.APPLY)
+    session_defaults = get_session_defaults(session_id, recalled)
+    parsed = apply_defaults_to_parsed(parsed, session_defaults, apply_now)
+    if parsed.intent in (Intent.LIST_PROJECTS, Intent.LIST_WORKBOOKS, Intent.LIST_VIEWS):
+        tool_name = {
+            Intent.LIST_PROJECTS: "list_tableau_projects",
+            Intent.LIST_WORKBOOKS: "list_tableau_workbooks",
+            Intent.LIST_VIEWS: "list_tableau_views",
+        }[parsed.intent]
+        args = {}
+        if parsed.intent == Intent.LIST_VIEWS and parsed.workbook_name:
+            args["workbook_name"] = parsed.workbook_name
+
+        try:
+            result = TOOL_REGISTRY[tool_name].invoke(args)
+        except Exception as e:
+            result = f"Tool '{tool_name}' failed: {e}"
+            log.error(result, exc_info=True)
+
+        step = {"name": tool_name, "args": args, "result": result}
+        attachments = _extract_attachments([step])
+
+        pp = _llm_post_process_answer(request.message, recalled, [step], llm_obj=llm)
+        final_text = _clean_output_text(pp or str(result), attachments)
+
+        memory_add(session_id, "user", request.message)
+        memory_add(session_id, "assistant", final_text)
+        return {"response": final_text, "attachments": attachments}
 
     if parsed.intent in (Intent.VIEW_IMAGE, Intent.VIEW_DATA):
         tool_name = "tableau_get_view_image" if parsed.intent == Intent.VIEW_IMAGE else "tableau_get_view_data"
@@ -725,7 +996,7 @@ async def chat_endpoint(request: ChatRequest):
         for step in tool_steps:
             if step["name"] in ("list_tableau_projects", "list_tableau_workbooks", "list_tableau_views"):
                 direct_text = str(step.get("result", "")).strip()
-                # If a tool ever returns JSON with {"text": "..."} pull that out
+                
                 if direct_text.startswith("{") and direct_text.endswith("}"):
                     try:
                         obj = json.loads(direct_text)
@@ -733,9 +1004,18 @@ async def chat_endpoint(request: ChatRequest):
                             direct_text = obj["text"]
                     except Exception:
                         pass
+
+                
                 attachments = _extract_attachments([step])
-                output_text = _clean_output_text(direct_text, attachments)
-                log.info("Returning direct list result for %s", step["name"])
+
+               
+                if tool_steps:
+                    pp = _llm_post_process_answer(request.message, recalled, tool_steps, llm_obj=llm_with_tools)
+                    if pp:
+                        final_text = pp
+
+                output_text = _clean_output_text(final_text, attachments)
+
                 memory_add(session_id, "user", request.message)
                 memory_add(session_id, "assistant", output_text)
                 return {"response": output_text, "attachments": attachments}

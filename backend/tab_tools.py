@@ -118,7 +118,10 @@ def list_tableau_projects() -> str:
         server.auth.sign_out()
         if not projs:
             return "No projects found."
-        return "Projects: " + ", ".join(p.name for p in projs)
+        return json.dumps({
+    "text": f"{len(projs)} project(s) found.",
+    "items": [p.name for p in projs]
+})
     except Exception as e:
         return f"Error listing projects: {e}"
 
