@@ -279,12 +279,12 @@ def _llm_parse_user_utterance(user_text: str, recalled_snippets: List[str]) -> P
     try:
         parsed: ParsedCommand = structured_llm.invoke([sys, hm])
         text_l = (user_text or "").lower()
-        if re.search(r"\blist|show|give me|what are\b", text_l):
+        if re.search(r"\b(list|list all|what are|give me a list of)\b", text_l):
             if "project" in text_l:
                 parsed.intent = Intent.LIST_PROJECTS
             elif "workbook" in text_l:
                 parsed.intent = Intent.LIST_WORKBOOKS
-            elif "view" in text_l:
+            elif "views" in text_l:
                 parsed.intent = Intent.LIST_VIEWS
         see_words = ("show", "display", "render", "image", "screenshot", "see", "preview")
         data_words = ("csv", "data", "table", "rows", "export", "download", "analyze", "analysis", "analytics")
@@ -892,7 +892,7 @@ async def chat_endpoint(request: ChatRequest):
             "filters_json": json.dumps(parsed.filters_json or {}),
         }
         if not args["view_name"]:
-            pass
+            return {"response": "Which view should I render? (e.g., view_name='Sales Overview', workbook_name='Superstore')", "attachments": []}
         else:
             try:
                 result = TOOL_REGISTRY[tool_name].invoke(args)
