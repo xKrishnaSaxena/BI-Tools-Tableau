@@ -83,8 +83,8 @@ app.add_middleware(
 def make_llm():
     if ChatGoogleGenerativeAI is not None and os.getenv("GOOGLE_API_KEY"):
         try:
-            log.info("Using Gemini chat model: gemini-2.0-flash-lite")
-            return ChatGoogleGenerativeAI(model="gemini-2.0-flash-lite", temperature=0)
+            log.info("Using Gemini chat model: gemini-2.5-flash-lite")
+            return ChatGoogleGenerativeAI(model="gemini-2.5-flash-lite", temperature=0)
         except Exception as e:
             log.error("Failed to init Gemini chat model: %s", e, exc_info=True)
     if ChatOpenAI is not None and os.getenv("OPENAI_API_KEY"):
