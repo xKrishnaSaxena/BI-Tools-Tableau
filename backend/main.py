@@ -80,25 +80,49 @@ app.add_middleware(
 )
 
 # ---------------- LLM selection ----------------
-def make_llm():
-    if ChatGoogleGenerativeAI is not None and os.getenv("GOOGLE_API_KEY"):
-        try:
-            log.info("Using Gemini chat model: gemini-2.5-flash-lite")
-            return ChatGoogleGenerativeAI(model="gemini-2.5-flash-lite", temperature=0)
-        except Exception as e:
-            log.error("Failed to init Gemini chat model: %s", e, exc_info=True)
-    if ChatOpenAI is not None and os.getenv("OPENAI_API_KEY"):
-        try:
-            log.info("Falling back to OpenAI chat model: gpt-4o-mini")
-            return ChatOpenAI(model="gpt-4o-mini", temperature=0)
-        except Exception as e:
-            log.error("Failed to init OpenAI chat model: %s", e, exc_info=True)
-    raise RuntimeError("No LLM configured. Set GOOGLE_API_KEY (Gemini) or OPENAI_API_KEY (OpenAI).")
+# ---------------- LLM selection ----------------
+def make_llm(api_key=None, model_name="gemini-2.5-flash-lite"):
+    if ChatGoogleGenerativeAI is None:
+        raise RuntimeError("langchain_google_genai not available.")
+    try:
+        api_key = api_key or os.getenv("GOOGLE_API_KEY")
+        if not api_key:
+            raise ValueError("No API key provided.")
+        log.info("Using Gemini chat model: %s with API key", model_name)
+        return ChatGoogleGenerativeAI(model=model_name, temperature=0, google_api_key=api_key)
+    except Exception as e:
+        log.error("Failed to init Gemini chat model: %s", e, exc_info=True)
+        raise
 
-llm = make_llm()
+def make_llm_2_0_publishing():
+    """
+    Create a dedicated LLM instance for publishing mock datasources.
+    Uses Gemini 2.0 Flash Lite with the secondary API key.
+    """
+    if ChatGoogleGenerativeAI is None:
+        raise RuntimeError("langchain_google_genai not available.")
+    try:
+        api_key = os.getenv("GOOGLE_API_KEY_2_0")
+        if not api_key:
+            raise ValueError("No GOOGLE_API_KEY_2_0 provided for publishing operations.")
+        log.info("Using Gemini 2.0 Flash Lite for publishing operations")
+        return ChatGoogleGenerativeAI(
+            model="gemini-2.0-flash-lite", 
+            temperature=0, 
+            google_api_key=api_key
+        )
+    except Exception as e:
+        log.error("Failed to init Gemini 2.0 chat model for publishing: %s", e, exc_info=True)
+        raise
 
+# Global LLMs
+llm_2_5 = make_llm()  # Default to 2.5 with primary API key
+llm_publishing = make_llm_2_0_publishing()  # Dedicated publishing LLM
+
+llm = llm_2_5
 
 # ---------------- Tools wiring ----------------
+TOOLS_PUBLISH_ONLY = [publish_mock_datasource]
 TOOLS = [
     list_tableau_projects,
     list_tableau_workbooks,
@@ -143,7 +167,6 @@ class Intent(str, Enum):
 class PublishArgs(BaseModel):
     project_name: Optional[str] = None
     datasource_name: Optional[str] = None
-    overwrite: Optional[bool] = None
 
 class PostProcessAnswer(BaseModel):
     answer: str
@@ -250,7 +273,7 @@ def _llm_parse_user_utterance(user_text: str, recalled_snippets: List[str]) -> P
         "Classify the user's intent and extract arguments into a strict schema. "
         "If filters are mentioned (e.g., Region=APAC 2024), normalize them into filters_json. "
         "If the user is asking you to remember/recall personal facts ('what is my...'), set intent=MEMORY_QA. "
-        "If the user wants to PUBLISH a mock datasource, fill publish.project_name/datasource_name/overwrite when present. "
+        "If the user wants to PUBLISH a mock datasource, fill publish.project_name/datasource_name when present. "
         "Prefer concrete values from the user text; do not hallucinate."
         "You are a deterministic command router for a Tableau assistant.\n"
         "- Map verbs:\n"
@@ -259,7 +282,7 @@ def _llm_parse_user_utterance(user_text: str, recalled_snippets: List[str]) -> P
         "  * If both appear, DATA wins (csv/export beats show).\n"
         "- Extract arguments into the strict schema. If filters are mentioned (e.g., Region=APAC, Year=2024), normalize into filters_json.\n"
         "- If the user is asking to remember/recall personal facts ('what is my ...'), set intent=MEMORY_QA.\n"
-        "- If the user wants to PUBLISH a mock datasource, fill publish.project_name/datasource_name/overwrite when present.\n"
+        "- If the user wants to PUBLISH a mock datasource, fill publish.project_name/datasource_name when present.\n"
         "- Prefer concrete values from the user text; do not hallucinate."
      ))
 
@@ -391,7 +414,7 @@ SYSTEM_PROMPT = """You are a helpful Tableau assistant named Alex.
 **Important (Publishing mock datasource):**
 - Do NOT call `publish_mock_datasource` with default names.
 - FIRST confirm `project_name` and `datasource_name`. If missing or default-like, ask the user:
-  "What project name and datasource name should I use? (optional: overwrite=true/false)"
+  "What project name and datasource name should I use?"
 - Only after the user confirms the names, call the tool with those names.
 
 **Memories (schema-free)**
@@ -896,7 +919,7 @@ async def chat_endpoint(request: ChatRequest):
             "filters_json": json.dumps(parsed.filters_json or {}),
         }
         if not args["view_name"]:
-            return {"response": "Which view should I render? (e.g., view_name='Sales Overview', workbook_name='Superstore')", "attachments": []}
+            pass
         else:
             try:
                 result = TOOL_REGISTRY[tool_name].invoke(args)
@@ -913,8 +936,6 @@ async def chat_endpoint(request: ChatRequest):
         pub = parsed.publish or PublishArgs()
         if pub.project_name and pub.datasource_name:
             args = {"project_name": pub.project_name, "datasource_name": pub.datasource_name}
-            if pub.overwrite is not None:
-                args["overwrite"] = bool(pub.overwrite)
             try:
                 result = publish_mock_datasource.invoke(args)
             except Exception as e:
@@ -938,7 +959,12 @@ async def chat_endpoint(request: ChatRequest):
 
 
     # --- 2) LLM call: decide tool calls ---
-    llm_with_tools = llm.bind_tools(TOOLS)
+    if parsed.intent == Intent.PUBLISH_MOCK:
+            # Use Gemini 2.0 Flash Lite ONLY for the publish flow
+            llm_with_tools = llm_publishing.bind_tools(TOOLS)
+    else:
+      # Everything else continues to use Gemini 2.5 Flash Lite
+     llm_with_tools = llm.bind_tools(TOOLS)
     msgs = _build_messages(request, facts_for_prompt, recalled)
     ai_first: AIMessage = llm_with_tools.invoke(msgs)
     log.debug("LLM first response length=%d, tool_calls=%s",
@@ -960,22 +986,18 @@ async def chat_endpoint(request: ChatRequest):
                 pub = parsed.publish or PublishArgs()
                 pn = args.get("project_name") or pub.project_name
                 dn = args.get("datasource_name") or pub.datasource_name
-                ow = args.get("overwrite")
-                if ow is None and pub.overwrite is not None:
-                    ow = pub.overwrite
+
                 if (not pn) or (not dn) or pn == "AI Demos" or dn == "AI_Sample_Sales":
                     result = json.dumps({
                         "error": "missing_parameters",
                         "text": ("I need a non-default project_name and datasource_name to publish. "
-                                 "Example: project=Team Analytics, datasource=Sandbox_Sales, overwrite=true/false")
+                                "Example: project=Team Analytics, datasource=Sandbox_Sales")
                     })
-                    tool_steps.append({"name": name, "args": {"project_name": pn, "datasource_name": dn, "overwrite": ow}, "result": result})
+                    tool_steps.append({"name": name, "args": {"project_name": pn, "datasource_name": dn}, "result": result})
                     tool_msgs.append(ToolMessage(tool_call_id=tc["id"], name=name, content=result))
                     continue
 
                 args = {"project_name": pn, "datasource_name": dn}
-                if ow is not None:
-                    args["overwrite"] = bool(ow)
             elif name in ("tableau_get_view_image", "tableau_get_view_data"):
                 # Pre-fill slots for view tools
                 if parsed.view_name and not args.get("view_name"):

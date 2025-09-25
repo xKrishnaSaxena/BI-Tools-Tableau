@@ -267,28 +267,18 @@ def tableau_get_view_data(view_name: str, workbook_name: str = "", filters_json:
 
 # ---------- WRITES ----------
 @tool
-def publish_mock_datasource(project_name: str = "AI Demos", datasource_name: str = "AI_Sample_Sales", overwrite: bool = False) -> str:
+def publish_mock_datasource(project_name: str = "AI Demos", datasource_name: str = "AI_Sample_Sales") -> str:
     """Create a small mock dataset, write to .hyper, and publish a datasource."""
     try:
         if isinstance(project_name, str) and ("=" in project_name or project_name.strip().startswith("{")):
             kv = _parse_react_kv(project_name)
             project_name = kv.get("project_name", project_name)
             datasource_name = kv.get("datasource_name", datasource_name)
-            ow = kv.get("overwrite", overwrite)
-            if isinstance(ow, str):
-                overwrite = ow.strip().lower() in ("1", "true", "yes", "y")
-            elif isinstance(ow, bool):
-                overwrite = ow
 
         if isinstance(datasource_name, str) and ("=" in datasource_name or datasource_name.strip().startswith("{")):
             kv = _parse_react_kv(datasource_name)
             datasource_name = kv.get("datasource_name", datasource_name)
             project_name = kv.get("project_name", project_name)
-            ow = kv.get("overwrite", overwrite)
-            if isinstance(ow, str):
-                overwrite = ow.strip().lower() in ("1", "true", "yes", "y")
-            elif isinstance(ow, bool):
-                overwrite = ow
 
         project_name = _coerce_one(project_name, "project_name")
         datasource_name = _coerce_one(datasource_name, "datasource_name")
@@ -306,18 +296,23 @@ def publish_mock_datasource(project_name: str = "AI Demos", datasource_name: str
             columns=["OrderDate", "Region", "Category", "Product", "Quantity", "Sales"],
         )
 
-        # Windows-safe temp path
-        hyper_path = os.path.join(tempfile.gettempdir(), f"{datasource_name}.hyper")
         pt.frame_to_hyper(df, hyper_path, table="Extract.Extract")
 
         server = _server()
         proj_id = _find_or_create_project(server, project_name or "AI Demos")
         ds_item = TSC.DatasourceItem(project_id=proj_id, name=datasource_name)
-        mode = TSC.Server.PublishMode.Overwrite if overwrite else TSC.Server.PublishMode.CreateNew
+
+        # Always create new. If the name already exists, Tableau will error (safer than overwriting).
+        mode = TSC.Server.PublishMode.CreateNew
         published = server.datasources.publish(ds_item, hyper_path, mode)
         server.auth.sign_out()
         return f"Published datasource '{published.name}' (id={published.id}) in project '{project_name or 'AI Demos'}'."
     except Exception as e:
+        try:
+            server.auth.sign_out()
+        except Exception:
+            pass
+        # Optional: nicer guidance if duplicate name collision occurs
         return f"Publish failed: {e}"
 
 
