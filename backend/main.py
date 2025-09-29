@@ -390,8 +390,11 @@ def maybe_pin_fact(session_id: str, text: str):
     fact = (m.group(1) if m else text).strip()
     if fact:
         try:
-            LANGMEM.add(session_id, f"[FACT] {fact}")
-            log.debug("Pinned fact to LangMem: %s", _truncate(fact))
+            stored = LANGMEM.add(session_id, f"[FACT] {fact}")
+            if stored:
+                log.debug("Pinned fact to LangMem: %s", _truncate(fact))
+            else:
+                log.debug("Skipped pin (LangMem unavailable).")
         except Exception as e:
             log.warning("Failed to pin fact: %s", e)
 
@@ -483,18 +486,19 @@ class LangMemWrapper:
             def _embed(texts):
                 items = _to_list(texts)
                 return embedder.embed_documents(items)
-
             self.store = InMemoryStore(index={"dims": dims, "embed": _embed})
+            self.manager = create_memory_store_manager(model, store=self.store)
+            self.available = True
+            log.info("LangMem initialized and available.")
         except Exception as e:
             log.error("Failed to initialize LangMem: %s", e, exc_info=True)
             self.available = False
 
     def add(self, session_id: str, text: str) -> bool:
-        if not self.available:
+        if not self.available or not self.manager:
             log.debug("LangMem.add skipped (unavailable)."); return False
         try:
             cfg = {"configurable": {"langgraph_user_id": session_id}}
-            log.debug("LangMem.add -> session=%s text=%s", session_id, _truncate(text))
             self.manager.invoke({"messages": [{"role": "user", "content": text}]}, config=cfg)
             log.info("LangMem.add stored OK: session=%s", session_id)
             return True
@@ -503,11 +507,10 @@ class LangMemWrapper:
             return False
 
     def search(self, session_id: str, query: str, k: int = RECALL_SEM_K) -> List[str]:
-        if not self.available:
+        if not self.available or not self.manager:
             log.debug("LangMem.search skipped (unavailable)."); return []
         try:
             cfg = {"configurable": {"langgraph_user_id": session_id}}
-            log.debug("LangMem.search -> session=%s k=%s query=%s", session_id, k, _truncate(query))
             results = self.manager.search(query=query, config=cfg, limit=k)
             out: List[str] = []
             for item in results or []:
@@ -521,8 +524,6 @@ class LangMemWrapper:
                 if text:
                     out.append(text)
             log.info("LangMem.search returned %d item(s) for session=%s", len(out), session_id)
-            for i, t in enumerate(out):
-                log.debug("LangMem.search[%d]: %s", i, _truncate(t, 300))
             return out[:k]
         except Exception as e:
             log.error("LangMem.search failed: session=%s err=%s", session_id, e, exc_info=True)
@@ -616,15 +617,13 @@ def _llm_post_process_answer(
     return text
 
 def memory_add(session_id: str, role: str, text: str):
-    """Store every user utterance in LangMem + user-tail."""
     cleaned_text = (text or "").strip()
     if not cleaned_text: return
     if role == "user":
-        stored = LANGMEM.add(session_id, cleaned_text)
+        LANGMEM.add(session_id, cleaned_text)
         USER_TAIL.add_user(session_id, cleaned_text)
-        log.debug("memory_add -> user stored: LangMem=%s, UserTail=YES", stored)
     else:
-        log.debug("memory_add -> assistant text (not stored in user-tail).")
+        LANGMEM.add(session_id, f"[ASSISTANT] {cleaned_text}")
 
 def memory_recall(session_id: str, query: str) -> List[str]:
     """Recall = LangMem semantic hits + user-tail (dedup, preserve order, cap)."""
@@ -851,6 +850,11 @@ async def chat_endpoint(request: ChatRequest):
 
     # --- 0) Schema-free memory Q&A (LangMem-only) ---
     maybe_pin_fact(session_id, request.message or "")
+    mem_ans = try_semantic_memory_answer(session_id, request.message)
+    if mem_ans:
+        memory_add(session_id, "user", request.message)
+        memory_add(session_id, "assistant", mem_ans)
+        return {"response": mem_ans, "attachments": []}
     primary_recall = memory_recall(session_id, request.message)
     extra_recall = gather_memory_snippets(session_id, request.message, extra_k=6)
     # merged recalled
