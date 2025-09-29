@@ -470,11 +470,17 @@ class LangMemWrapper:
             if GoogleGenerativeAIEmbeddings is None or not os.getenv("GOOGLE_API_KEY"):
                 log.warning("Gemini embeddings unavailable; LangMem disabled.")
                 return
-            gem_model = os.getenv("GEMINI_EMBED_MODEL", "text-embedding-004")
-            dims = int(os.getenv("EMBED_DIMS", "768"))
+            gem_model = os.getenv("GEMINI_EMBED_MODEL", "text-embedding-004").strip()
+            if not gem_model.startswith("models/"):
+                gem_model = f"models/{gem_model}"
+
             embedder = GoogleGenerativeAIEmbeddings(
-                model=gem_model, google_api_key=os.getenv("GOOGLE_API_KEY")
+                model=gem_model,
+                google_api_key=os.getenv("GOOGLE_API_KEY"),
+                # optional: dimensions=768
             )
+            dims = int(os.getenv("EMBED_DIMS", "768"))
+            
             def _to_list(x):
                 if isinstance(x, str):
                     return [x]
