@@ -1,5 +1,15 @@
 import { useState, useRef, useEffect } from "react";
-
+const getOrCreateSid = () => {
+  let sid = localStorage.getItem("agent_sid");
+  if (!sid) {
+    sid = (
+      crypto?.randomUUID?.() || `${Date.now()}-${Math.random()}`
+    ).toString();
+    localStorage.setItem("agent_sid", sid);
+  }
+  return sid;
+};
+const sessionId = getOrCreateSid();
 function DataTable({ rows, columns }) {
   if (!rows || rows.length === 0) return null;
   const cols = columns && columns.length ? columns : Object.keys(rows[0]);
@@ -94,14 +104,14 @@ export default function App() {
     setIsLoading(true);
 
     try {
-      const response = await fetch(
-        "http://localhost:8000/chat",
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ message: userMessage.text }),
-        }
-      );
+      const response = await fetch("http://localhost:8000/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          message: userMessage.text,
+          session_id: sessionId,
+        }),
+      });
 
       const data = await response.json();
       const botMessage = {
