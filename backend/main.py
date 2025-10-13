@@ -48,7 +48,7 @@ async def chat_endpoint(request: ChatRequest):
     init_state = {
     "session_id": session_id,
     "user_text": request.message.strip(),
-    "messages": [],  # Already resets, but confirm
+    # Removed "messages": [] to allow persistence via checkpoint
     "tool_steps": [],  # Explicitly reset to avoid accumulation
     "attachments": [],  # Reset
     "recalled": [],  # Optional: if you want fresh recall each time

@@ -25,6 +25,18 @@ from tab_tools import (
     tableau_get_view_data,
     publish_mock_datasource,
 )
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from google.api_core.exceptions import ResourceExhausted,DeadlineExceeded  # Import for retry_if
+
+# Add this decorator to LLM functions
+@retry(
+    retry=retry_if_exception_type((ResourceExhausted, DeadlineExceeded)),
+    stop=stop_after_attempt(2),  # Reduce from 3 to 2
+    wait=wait_exponential(multiplier=1, min=2, max=10),  # Shorter waits
+    reraise=True
+)
+def safe_llm_invoke(llm, messages):
+    return llm.invoke(messages)
 
 def _setup_logging():
     level = os.getenv("LOG_LEVEL", "DEBUG").upper()
@@ -47,14 +59,26 @@ def make_llm(api_key=None, model_name="gemini-2.5-flash-lite"):
         if not api_key:
             raise ValueError("No API key provided.")
         log.info("Using Gemini chat model: %s with API key", model_name)
-        return ChatGoogleGenerativeAI(model=model_name, temperature=0.2, google_api_key=api_key)  # Slight temp for naturalness
+        return ChatGoogleGenerativeAI(
+            model=model_name, 
+            temperature=0.2, 
+            google_api_key=api_key,
+            timeout=30.0,  # Add timeout
+            max_retries=2   # Limit retries
+        )  # Slight temp for naturalness
     except Exception as e:
         log.error("Failed to init Gemini chat model: %s", e, exc_info=True)
         raise
 
 def make_llm_parsing():
     api_key = os.getenv("GOOGLE_API_KEY")
-    return ChatGoogleGenerativeAI(model="gemini-2.5-flash-lite", temperature=0, google_api_key=api_key)  # Temp 0 for deterministic parsing
+    return ChatGoogleGenerativeAI(
+        model="gemini-2.5-flash-lite", 
+        temperature=0, 
+        google_api_key=api_key,
+        timeout=15.0,  # Shorter timeout for parsing
+        max_retries=1
+    )  # Temp 0 for deterministic parsing
 
 def make_llm_2_0_publishing():
     if ChatGoogleGenerativeAI is None:
@@ -119,6 +143,7 @@ class Intent(str, Enum):
     LIST_PROJECTS = "list_projects"          
     LIST_WORKBOOKS = "list_workbooks"       
     LIST_VIEWS = "list_views"                
+    GENERAL_QA = "general_qa"  # New intent for general questions
     UNKNOWN = "unknown"
 
 class PublishArgs(BaseModel):
@@ -138,6 +163,7 @@ class ParsedCommand(BaseModel):
     view_name: Optional[str] = None
     workbook_name: Optional[str] = None
     filters_json: Optional[Dict[str, Any]] = None   
+    
     @field_validator("filters_json", mode="before")
     @classmethod
     def _filters_json_coerce(cls, v):
@@ -224,7 +250,7 @@ def _llm_understand_defaults_command(user_text: str, recalled: List[str]) -> Def
     except Exception:
         return DefaultsAction(action=DefaultsActionType.NONE)
 
-def _llm_parse_user_utterance(user_text: str, recalled_snippets: List[str]) -> ParsedCommand:
+def _llm_parse_user_utterance(user_text: str, recalled_snippets: List[str], messages: List[AnyMessage] = []) -> ParsedCommand:
     sys = SystemMessage(content=(
         "You are a friendly data analyst assistant specializing in Tableau. Classify the user's intent and extract arguments precisely.\n"
         "- Be natural and infer like a colleague would.\n"
@@ -234,14 +260,19 @@ def _llm_parse_user_utterance(user_text: str, recalled_snippets: List[str]) -> P
         "  * If both, prefer VIEW_DATA if data export is mentioned.\n"
         "- For filters (e.g., 'only South Region in 2024'), normalize to filters_json like {'Region': 'South', 'Year': '2024'}.\n"
         "- If asking to recall facts ('what is my name?', 'where do I work?'), set intent=MEMORY_QA and is_specific_memory_question=True.\n"
+        "- If asking about the conversation ('what are we talking about?', 'what happened so far?'), set intent=MEMORY_QA and is_specific_memory_question=True.\n"
         "- If stating facts ('my name is X', 'I work in Y'), even without 'remember', set intent=MEMORY_SET and memory_fact={'name': 'X'} or similar.\n"
         "- For MEMORY_SET, memory_fact must be a simple dict like {\"name\": \"krishna\"}.\n"
+        "- For PUBLISH_MOCK, ALWAYS extract project_name and datasource_name into publish if mentioned, even if phrased as a response (e.g., to 'what names?'). Use context from snippets to infer this is for publishing.\n"
+        "- Do NOT confuse project/datasource names with view/workbook names—PUBLISH_MOCK is about creating datasources, not views.\n"
         "- If requesting to publish mock data, set intent=PUBLISH_MOCK and fill publish fields.\n"
         "- For help/capabilities, set HELP.\n"
         "- For greetings/small talk, set SMALLTALK.\n"
         "- For listing ('list projects', 'what workbooks are there?'), set LIST_* accordingly.\n"
+        "- For general questions about Tableau or data analysis (e.g., 'What is Tableau?', 'How does a dashboard work?'), set GENERAL_QA.\n"
         "- If unclear, set UNKNOWN.\n"
-        "- Use snippets for context, e.g., apply past filters if relevant.\n"
+        "- Use snippets for context, e.g., apply past filters if relevant. If snippets show the assistant asked for project/datasource names, treat the user's reply as filling those for PUBLISH_MOCK.\n"
+        "If recent history or snippets show the assistant asked for project/datasource names, treat the user's reply (even if just names) as filling those for PUBLISH_MOCK."
         "Examples:\n"
         "User: hi\n"
         "Parsed: intent=SMALLTALK\n"
@@ -261,16 +292,30 @@ def _llm_parse_user_utterance(user_text: str, recalled_snippets: List[str]) -> P
         "Parsed: intent=LIST_PROJECTS\n"
         "User: publish mock data to project AI Demos, datasource Sample\n"
         "Parsed: intent=PUBLISH_MOCK, publish={\"project_name\": \"AI Demos\", \"datasource_name\": \"Sample\"}\n"
+        "User: project name is MyProj, datasource MyData\n"  # New example
+        "Parsed: intent=PUBLISH_MOCK, publish={\"project_name\": \"MyProj\", \"datasource_name\": \"MyData\"}\n"  # New example
+        "User: use genfx for project and genfx_Data for datasource\n"  # New example
+        "Parsed: intent=PUBLISH_MOCK, publish={\"project_name\": \"genfx\", \"datasource_name\": \"genfx_Data\"}\n"  # New example
+        "User: what is tableau?\n"
+        "Parsed: intent=GENERAL_QA\n"
+        "User: explain data visualization\n"
+        "Parsed: intent=GENERAL_QA\n"
+        "User: what are we talking about?\n"
+        "Parsed: intent=MEMORY_QA, is_specific_memory_question=True\n"
+        "User: summarize our conversation so far\n"
+        "Parsed: intent=MEMORY_QA, is_specific_memory_question=True\n"
         "User: remember my favorite color is blue\n"
         "Parsed: intent=MEMORY_SET, memory_fact={\"favorite color\": \"blue\"}\n"
         "User: what's my favorite color?\n"
         "Parsed: intent=MEMORY_QA, is_specific_memory_question=True\n"
     ))
-
+    recent_history = "\n".join([f"{msg.type}: {msg.content[:200]}" for msg in messages[-6:]])  
     snippet_block = ""
     if recalled_snippets:
         top = recalled_snippets[:6]
-        snippet_block = "Relevant snippets:\n- " + "\n- ".join(top) + "\n"
+        snippet_block += "Relevant snippets (most recent last):\n- " + "\n- ".join(top) + "\n"
+    if recent_history:
+        snippet_block += f"\nRecent conversation history:\n{recent_history}\n"
 
     structured_llm = llm_parsing.with_structured_output(ParsedCommand)
     hm = HumanMessage(content=(
@@ -279,7 +324,7 @@ def _llm_parse_user_utterance(user_text: str, recalled_snippets: List[str]) -> P
         f"User message:\n{user_text}"
     ))
     try:
-        parsed: ParsedCommand = structured_llm.invoke([sys, hm])
+        parsed: ParsedCommand = safe_llm_invoke(structured_llm, [sys, hm])
         log.info(f"Parsed intent for '{user_text}': {parsed.intent}, reason: {parsed.reason}")
         if isinstance(parsed.filters_json, str):
             try:
@@ -287,6 +332,27 @@ def _llm_parse_user_utterance(user_text: str, recalled_snippets: List[str]) -> P
                 parsed.filters_json = fj if isinstance(fj, dict) else None
             except Exception:
                 parsed.filters_json = None
+        
+        # New: Post-parsing fix for misassigned fields in PUBLISH_MOCK
+        if parsed.intent == Intent.PUBLISH_MOCK and parsed.publish is None:
+            if parsed.workbook_name or parsed.view_name:
+                # Heuristic: Reassign if misparsed as view/workbook
+                parsed.publish = PublishArgs(
+                    project_name=parsed.workbook_name or "AI Demos",
+                    datasource_name=parsed.view_name or "AI_Sample_Sales"
+                )
+                parsed.workbook_name = None
+                parsed.view_name = None
+                log.info(f"Post-parse fix: Reassigned to publish={parsed.publish}")
+            elif recalled_snippets:  # Fallback: Infer from recent snippets if still None
+                inferred = _llm_infer_defaults_from_snippets(recalled_snippets)  # Reuse existing infer func
+                if 'project_name' in inferred or 'datasource_name' in inferred:
+                    parsed.publish = PublishArgs(
+                        project_name=inferred.get('project_name', "AI Demos"),
+                        datasource_name=inferred.get('datasource_name', "AI_Sample_Sales")
+                    )
+                    log.info(f"Post-parse infer from snippets: publish={parsed.publish}")
+        
         return parsed
     except Exception as e:
         log.warning("LLM parse failed, falling back to UNKNOWN: %s", e, exc_info=True)
@@ -330,9 +396,9 @@ def _truncate(s: str, n: int = 200) -> str:
     return (s[: n - 3] + "...") if s and len(s) > n else (s or "")
 
 USER_TAIL_MAX = int(os.getenv("USER_TAIL_MAX", "600"))
-RECALL_SEM_K = int(os.getenv("RECALL_SEM_K", "24"))
-RECALL_TAIL_K = int(os.getenv("RECALL_TAIL_K", "24"))
-RECALL_TOTAL_K = int(os.getenv("RECALL_TOTAL_K", "32"))
+RECALL_SEM_K = int(os.getenv("RECALL_SEM_K", "48"))
+RECALL_TAIL_K = int(os.getenv("RECALL_TAIL_K", "48"))
+RECALL_TOTAL_K = int(os.getenv("RECALL_TOTAL_K", "48"))
 MEMORY_Q_TAIL_K = int(os.getenv("MEMORY_Q_TAIL_K", "64")) 
 
 class UserTailMemory:
@@ -487,9 +553,9 @@ def _llm_post_process_answer(
 
     structured = (llm_obj or llm).with_structured_output(PostProcessAnswer)
     try:
-        resp: PostProcessAnswer = structured.invoke([sys, HumanMessage(content=prompt)])
+        resp: PostProcessAnswer = safe_llm_invoke(structured, [sys, HumanMessage(content=prompt)])
     except Exception:
-        raw = (llm_obj or llm).invoke([sys, HumanMessage(content=prompt)])
+        raw = safe_llm_invoke(llm, [sys, HumanMessage(content=prompt)])
         return (raw.content or "").strip()
 
     text = (resp.answer or "").strip()
@@ -512,7 +578,8 @@ def memory_add(session_id: str, role: str, text: str):
         LANGMEM.add(session_id, f"[ASSISTANT] {cleaned_text}")
 
 def memory_recall(session_id: str, query: str) -> List[str]:
-    sem = LANGMEM.search(session_id, query, k=RECALL_SEM_K) or []
+    augmented_query = f"{query} recent conversation assistant response project datasource names"
+    sem = LANGMEM.search(session_id, augmented_query, k=RECALL_SEM_K) or []
     tail = USER_TAIL.last_n(session_id, n=RECALL_TAIL_K) or []
     seen = set(); merged: List[str] = []
     for item in sem + tail:
@@ -550,33 +617,68 @@ def _supported_by_snippets(ans: str, snippets: List[str]) -> bool:
     haystack = " ".join(snippets).lower()
     return any(p in haystack for p in parts)
 
+def _summarize_history(messages: List[AnyMessage], max_len: int = 2000) -> str:
+    """Summarize conversation history for context."""
+    history_text = "\n".join([f"{msg.type}: {msg.content}" for msg in messages[-10:]])  # Last 10 messages
+    if len(history_text) <= max_len:
+        return history_text
+    # Use LLM to summarize if too long
+    sys = SystemMessage(content="Summarize the following conversation history concisely.")
+    prompt = HumanMessage(content=history_text)
+    resp = safe_llm_invoke(llm, [sys, prompt])
+    return resp.content.strip()
+
 def memory_qa(state: AgentState) -> AgentState:
     session_id = state["session_id"]
     user_text = state["user_text"]
     snippets = gather_memory_snippets(session_id, user_text)
-    if not snippets:
+    history_summary = _summarize_history(state.get("messages", []))  # Add history summary
+    if not snippets and not history_summary:
         return {"final_text": "Sorry, I don't recall that right now. Could you remind me?"}
 
     sys = (
-        "You are a friendly data analyst. Answer using ONLY the snippets below. "
+        "You are a friendly data analyst. Answer using ONLY the snippets and history below. "
         "Be natural and helpful, like 'From what I remember, your name is...'. "
         "If the answer isn't clear, politely say you don't recall."
     )
     prompt = (
         f"Snippets:\n- " + "\n- ".join(snippets) + "\n\n"
+        f"Conversation history summary:\n{history_summary or '- (none)'}\n\n"
         f"Question: {user_text}\n\n"
         "Respond conversationally:"
     )
     try:
-        resp: AIMessage = llm.invoke([SystemMessage(content=sys), HumanMessage(content=prompt)])
+        resp: AIMessage = safe_llm_invoke(llm, [SystemMessage(content=sys), HumanMessage(content=prompt)])
         ans = (resp.content or "").strip()
-        if not ans or not _supported_by_snippets(ans, snippets):
+        if not ans or not _supported_by_snippets(ans, snippets + [history_summary]):
             ans = "Hmm, I couldn't find that in my notes. Want to tell me again so I can jot it down?"
         if 'my ' in ans.lower():
             ans = ans.replace('my ', 'your ').replace('My ', 'Your ')
         return {"final_text": ans}
     except Exception:
         return {"final_text": "Sorry, something went wrong while checking my notes. Let's try that again."}
+
+# New node for general QA
+def general_qa(state: AgentState) -> AgentState:
+    user_text = state["user_text"]
+    history_summary = _summarize_history(state.get("messages", []))  # Include history for context
+
+    sys = SystemMessage(content=(
+        "You are an expert Tableau data analyst. Answer general questions about Tableau, data visualization, "
+        "analytics, dashboards, etc., in a helpful, professional tone. Use your knowledge base. "
+        "Keep responses concise and accurate. If the question relates to the conversation, reference the history."
+    ))
+    prompt = (
+        f"Conversation history summary (for context):\n{history_summary or '- (none)'}\n\n"
+        f"User question: {user_text}\n\n"
+        "Provide a clear, informative answer:"
+    )
+    try:
+        resp: AIMessage = safe_llm_invoke(llm, [sys, HumanMessage(content=prompt)])
+        ans = (resp.content or "").strip()
+        return {"final_text": ans}
+    except Exception:
+        return {"final_text": "Sorry, I encountered an issue answering that. Let's try rephrasing."}
 
 # ---------------- Cleaning / attachments ----------------
 def _clean_output_text(text: str, attachments) -> str:
@@ -699,7 +801,8 @@ def recall(state: AgentState) -> AgentState:
 def parse_and_defaults_cmd(state: AgentState) -> AgentState:
     text = state["user_text"]
     recalled = state.get("recalled", [])
-    parsed = _llm_parse_user_utterance(text, recalled)
+    messages = state.get("messages", [])
+    parsed = _llm_parse_user_utterance(text, recalled,messages)
     defaults_cmd = _llm_understand_defaults_command(text, recalled)
 
     session_id = state["session_id"]
@@ -777,7 +880,7 @@ def router(state: AgentState) -> AgentState:
 
         prompt = HumanMessage(content=f"Previous greetings if any: {previous_str} \nUser: {state['user_text']}")
 
-        resp = llm.invoke([sys, prompt])
+        resp = safe_llm_invoke(llm, [sys, prompt])
         greeting = resp.content.strip() or "Hey! Good to hear from you. What data insights can I help with today?"
         return {
             "final_text": greeting,
@@ -788,11 +891,14 @@ def router(state: AgentState) -> AgentState:
             "final_text": "I'm your go-to for Tableau tasks—like listing projects, workbooks, or views; pulling images or data from views (with filters if needed); publishing mock datasources; or even remembering details about you. Just let me know what you need!",
             "route": "finalize"
         }
+    if parsed.intent == Intent.GENERAL_QA:  # New route
+        return {"route": "general_qa"}
     if parsed.intent == Intent.PUBLISH_MOCK:
         pub = parsed.publish or PublishArgs()
         pn = (pub.project_name or "").strip()
         dn = (pub.datasource_name or "").strip()
         if not pn or not dn or pn == "AI Demos" or dn == "AI_Sample_Sales":
+            log.warning(f"PUBLISH_MOCK intent but missing names: pn={pn}, dn={dn}. Falling back.")
             return {
                 "final_text": "No problem—what project and datasource names should I use for that?",
                 "route": "finalize"
@@ -910,6 +1016,8 @@ def finalize_and_store(state: AgentState) -> AgentState:
     session_id = state["session_id"]
     user_text = state["user_text"]
     final_text = state.get("final_text", "") or "All set!"
+    # Append assistant response to messages
+    state["messages"].append(AIMessage(content=final_text))
 
     memory_add(session_id, "user", user_text)
     memory_add(session_id, "assistant", final_text)
@@ -925,6 +1033,7 @@ def build_graph():
     graph.add_node("apply_defaults", apply_defaults_node)
     graph.add_node("router", router)
     graph.add_node("memory_qa", memory_qa)
+    graph.add_node("general_qa", general_qa)  # New node
     graph.add_node("call_tool_list", call_tool_list)
     graph.add_node("call_tool_view", call_tool_view)
     graph.add_node("call_tool_publish", call_tool_publish)
@@ -950,6 +1059,7 @@ def build_graph():
         return state.get("route", "finalize")
     graph.add_conditional_edges("router", _route_decider, {
         "memory_qa": "memory_qa",
+        "general_qa": "general_qa",  # New
         "call_tool_list": "call_tool_list",
         "call_tool_view": "call_tool_view",
         "call_tool_publish": "call_tool_publish",
@@ -957,11 +1067,12 @@ def build_graph():
     })
 
     graph.add_edge("memory_qa", "finalize")
+    graph.add_edge("general_qa", "finalize")  # New
     graph.add_edge("call_tool_list", "postprocess")
     graph.add_edge("call_tool_view", "postprocess")
     graph.add_edge("call_tool_publish", "postprocess")
     graph.add_edge("postprocess", "finalize")
 
     checkpointer = MemorySaver()
-    app_graph = graph.compile()
+    app_graph = graph.compile(checkpointer=checkpointer)  # Enable checkpointing
     return app_graph
