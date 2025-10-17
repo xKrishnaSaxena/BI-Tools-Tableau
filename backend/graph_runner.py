@@ -854,6 +854,13 @@ def ingest(state: AgentState) -> AgentState:
     text = state["user_text"].strip()
     return {
         "messages": [HumanMessage(content=text)],
+        # reset transient/turn-scoped fields
+        "route": None,
+        "final_text": "",
+        "tool_steps": [],
+        "attachments": [],
+        "defaults_cmd": DefaultsAction(),  # optional
+        "parsed": None,                    # optional
     }
 
 # 2) Recall snippets
@@ -1134,7 +1141,7 @@ def build_graph():
     graph.add_edge("recall", "parse_and_defaults_cmd")
 
     def _after_parse(state: AgentState):
-        if state.get("route") == "finalize":  # From clear defaults
+        if state.get("route") == "finalize" and state.get("final_text"): 
             return "finalize"
         return "apply_defaults"
     graph.add_conditional_edges("parse_and_defaults_cmd", _after_parse, {
@@ -1162,5 +1169,6 @@ def build_graph():
     graph.add_edge("call_tool_publish", "postprocess")
     graph.add_edge("postprocess", "finalize")
 
-   # No checkpointer: state is per-request only (no persistence between calls)
-    return graph.compile()
+    checkpointer=MemorySaver()
+    app_graph=graph.compile(checkpointer=checkpointer)
+    return app_graph
