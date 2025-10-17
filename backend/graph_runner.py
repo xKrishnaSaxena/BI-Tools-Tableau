@@ -251,9 +251,14 @@ def _llm_understand_defaults_command(user_text: str, recalled: List[str]) -> Def
         return DefaultsAction(action=DefaultsActionType.NONE)
 
 def _llm_parse_user_utterance(user_text: str, recalled_snippets: List[str], messages: List[AnyMessage] = []) -> ParsedCommand:
+    # --- System prompt (includes Fix 4 content update) ---
     sys = SystemMessage(content=(
         "You are a friendly data analyst assistant specializing in Tableau. Classify the user's intent and extract arguments precisely.\n"
         "- Be natural and infer like a colleague would.\n"
+        "- CRITICAL FOR PUBLISH_MOCK: If the recent conversation shows the assistant asked for project/datasource names, "
+        "treat ANY user response with names (even just 'X and Y' or 'project is X, datasource is Y') as intent=PUBLISH_MOCK.\n"
+        "- For PUBLISH_MOCK, ALWAYS populate publish.project_name and publish.datasource_name from the user's text.\n"
+        "- Look for patterns like: 'project name is X', 'use Y for datasource', 'X and Y', 'project: A, datasource: B'\n"
         "- Map verbs:\n"
         "  * SEE/visualize → VIEW_IMAGE (e.g., 'show me', 'display', 'render image', 'preview').\n"
         "  * DATA/analysis → VIEW_DATA (e.g., 'export csv', 'get data', 'analyze table', 'download rows').\n"
@@ -262,54 +267,22 @@ def _llm_parse_user_utterance(user_text: str, recalled_snippets: List[str], mess
         "- If asking to recall facts ('what is my name?', 'where do I work?'), set intent=MEMORY_QA and is_specific_memory_question=True.\n"
         "- If asking about the conversation ('what are we talking about?', 'what happened so far?'), set intent=MEMORY_QA and is_specific_memory_question=True.\n"
         "- If stating facts ('my name is X', 'I work in Y'), even without 'remember', set intent=MEMORY_SET and memory_fact={'name': 'X'} or similar.\n"
-        "- For MEMORY_SET, memory_fact must be a simple dict like {\"name\": \"krishna\"}.\n"
-        "- For PUBLISH_MOCK, ALWAYS extract project_name and datasource_name into publish if mentioned, even if phrased as a response (e.g., to 'what names?'). Use context from snippets to infer this is for publishing.\n"
         "- Do NOT confuse project/datasource names with view/workbook names—PUBLISH_MOCK is about creating datasources, not views.\n"
         "- If requesting to publish mock data, set intent=PUBLISH_MOCK and fill publish fields.\n"
         "- For help/capabilities, set HELP.\n"
         "- For greetings/small talk, set SMALLTALK.\n"
         "- For listing ('list projects', 'what workbooks are there?'), set LIST_* accordingly.\n"
-        "- For general questions about Tableau or data analysis (e.g., 'What is Tableau?', 'How does a dashboard work?'), set GENERAL_QA.\n"
+        "- For general questions about Tableau or data analysis (e.g., 'What is Tableau?'), set GENERAL_QA.\n"
         "- If unclear, set UNKNOWN.\n"
-        "- Use snippets for context, e.g., apply past filters if relevant. If snippets show the assistant asked for project/datasource names, treat the user's reply as filling those for PUBLISH_MOCK.\n"
-        "If recent history or snippets show the assistant asked for project/datasource names, treat the user's reply (even if just names) as filling those for PUBLISH_MOCK."
+        "- Use snippets for context; if snippets show the assistant asked for project/datasource names, treat the user's reply as filling those for PUBLISH_MOCK.\n"
         "Examples:\n"
-        "User: hi\n"
-        "Parsed: intent=SMALLTALK\n"
-        "User: what can you do?\n"
-        "Parsed: intent=HELP\n"
-        "User: what are the things you can do\n"
-        "Parsed: intent=HELP\n"
-        "User: what is my name?\n"
-        "Parsed: intent=MEMORY_QA, is_specific_memory_question=True\n"
-        "User: my name is Krishna\n"
-        "Parsed: intent=MEMORY_SET, memory_fact={\"name\": \"Krishna\"}\n"
-        "User: show me the sales overview\n"
-        "Parsed: intent=VIEW_IMAGE, view_name=\"sales overview\"\n"
-        "User: export data from profit by category\n"
-        "Parsed: intent=VIEW_DATA, view_name=\"profit by category\"\n"
-        "User: list all projects\n"
-        "Parsed: intent=LIST_PROJECTS\n"
-        "User: publish mock data to project AI Demos, datasource Sample\n"
-        "Parsed: intent=PUBLISH_MOCK, publish={\"project_name\": \"AI Demos\", \"datasource_name\": \"Sample\"}\n"
-        "User: project name is MyProj, datasource MyData\n"  # New example
-        "Parsed: intent=PUBLISH_MOCK, publish={\"project_name\": \"MyProj\", \"datasource_name\": \"MyData\"}\n"  # New example
-        "User: use genfx for project and genfx_Data for datasource\n"  # New example
-        "Parsed: intent=PUBLISH_MOCK, publish={\"project_name\": \"genfx\", \"datasource_name\": \"genfx_Data\"}\n"  # New example
-        "User: what is tableau?\n"
-        "Parsed: intent=GENERAL_QA\n"
-        "User: explain data visualization\n"
-        "Parsed: intent=GENERAL_QA\n"
-        "User: what are we talking about?\n"
-        "Parsed: intent=MEMORY_QA, is_specific_memory_question=True\n"
-        "User: summarize our conversation so far\n"
-        "Parsed: intent=MEMORY_QA, is_specific_memory_question=True\n"
-        "User: remember my favorite color is blue\n"
-        "Parsed: intent=MEMORY_SET, memory_fact={\"favorite color\": \"blue\"}\n"
-        "User: what's my favorite color?\n"
-        "Parsed: intent=MEMORY_QA, is_specific_memory_question=True\n"
+        "User: project name is sam and datasource name is kamal\n"
+        "Parsed: intent=PUBLISH_MOCK, publish={\"project_name\": \"sam\", \"datasource_name\": \"kamal\"}\n"
+        "User: sam and kamal (when context shows we asked for publish names)\n"
+        "Parsed: intent=PUBLISH_MOCK, publish={\"project_name\": \"sam\", \"datasource_name\": \"kamal\"}\n"
     ))
-    recent_history = "\n".join([f"{msg.type}: {msg.content[:200]}" for msg in messages[-6:]])  
+
+    recent_history = "\n".join([f"{msg.type}: {str(msg.content)[:200]}" for msg in messages[-6:]])
     snippet_block = ""
     if recalled_snippets:
         top = recalled_snippets[:6]
@@ -323,36 +296,55 @@ def _llm_parse_user_utterance(user_text: str, recalled_snippets: List[str], mess
         "Return ONLY fields defined by the schema; avoid made-up keys.\n\n"
         f"User message:\n{user_text}"
     ))
+
     try:
         parsed: ParsedCommand = safe_llm_invoke(structured_llm, [sys, hm])
         log.info(f"Parsed intent for '{user_text}': {parsed.intent}, reason: {parsed.reason}")
+
         if isinstance(parsed.filters_json, str):
             try:
                 fj = json.loads(parsed.filters_json)
                 parsed.filters_json = fj if isinstance(fj, dict) else None
             except Exception:
                 parsed.filters_json = None
-        
-        # New: Post-parsing fix for misassigned fields in PUBLISH_MOCK
-        if parsed.intent == Intent.PUBLISH_MOCK and parsed.publish is None:
-            if parsed.workbook_name or parsed.view_name:
-                # Heuristic: Reassign if misparsed as view/workbook
-                parsed.publish = PublishArgs(
-                    project_name=parsed.workbook_name or "AI Demos",
-                    datasource_name=parsed.view_name or "AI_Sample_Sales"
-                )
-                parsed.workbook_name = None
-                parsed.view_name = None
-                log.info(f"Post-parse fix: Reassigned to publish={parsed.publish}")
-            elif recalled_snippets:  # Fallback: Infer from recent snippets if still None
-                inferred = _llm_infer_defaults_from_snippets(recalled_snippets)  # Reuse existing infer func
-                if 'project_name' in inferred or 'datasource_name' in inferred:
+
+        # ENHANCED: Post-parsing fix for PUBLISH_MOCK
+        if parsed.intent == Intent.PUBLISH_MOCK:
+            # If publish is None or has default/empty values
+            if parsed.publish is None or not parsed.publish.project_name or not parsed.publish.datasource_name:
+                # Check if this is a follow-up response to a request for names
+                if _is_publish_followup(messages, recalled_snippets, user_text):
+                    # Extract names from the user's message
+                    extracted = _extract_project_datasource_names(user_text)
+                    if extracted['project_name'] or extracted['datasource_name']:
+                        parsed.publish = PublishArgs(
+                            project_name=extracted['project_name'] or "AI Demos",
+                            datasource_name=extracted['datasource_name'] or "AI_Sample_Sales"
+                        )
+                        log.info(f"Post-parse fix applied: publish={parsed.publish}")
+
+                # Fallback: Check if misparsed to workbook/view fields
+                elif parsed.workbook_name or parsed.view_name:
                     parsed.publish = PublishArgs(
-                        project_name=inferred.get('project_name', "AI Demos"),
-                        datasource_name=inferred.get('datasource_name', "AI_Sample_Sales")
+                        project_name=parsed.workbook_name or "AI Demos",
+                        datasource_name=parsed.view_name or "AI_Sample_Sales"
                     )
-                    log.info(f"Post-parse infer from snippets: publish={parsed.publish}")
-        
+                    parsed.workbook_name = None
+                    parsed.view_name = None
+                    log.info(f"Post-parse reassignment: publish={parsed.publish}")
+
+        # If still not PUBLISH_MOCK but context suggests it should be
+        elif parsed.intent in (Intent.UNKNOWN, Intent.SMALLTALK) and _is_publish_followup(messages, recalled_snippets, user_text):
+            extracted = _extract_project_datasource_names(user_text)
+            if extracted['project_name'] or extracted['datasource_name']:
+                parsed.intent = Intent.PUBLISH_MOCK
+                parsed.publish = PublishArgs(
+                    project_name=extracted['project_name'] or "AI Demos",
+                    datasource_name=extracted['datasource_name'] or "AI_Sample_Sales"
+                )
+                parsed.reason = "Corrected to PUBLISH_MOCK based on context"
+                log.info(f"Intent corrected to PUBLISH_MOCK: publish={parsed.publish}")
+
         return parsed
     except Exception as e:
         log.warning("LLM parse failed, falling back to UNKNOWN: %s", e, exc_info=True)
@@ -390,6 +382,86 @@ def apply_defaults_to_parsed(
         parsed.filters_json = merged or None
 
     return parsed
+
+def _is_publish_followup(messages: List[AnyMessage], recalled_snippets: List[str], user_text: str) -> bool:
+    """
+    Detect if this message is a follow-up response to a request for project/datasource names.
+    """
+    # Check last 4 assistant messages for asking about publish info
+    try:
+        recent_assistant_msgs = [
+            (msg.content or "").lower() for msg in messages[-4:]
+            if isinstance(msg, AIMessage)
+        ]
+    except Exception:
+        recent_assistant_msgs = []
+
+    # Keywords that indicate we asked for publish info
+    publish_ask_patterns = [
+        'what project', 'which project', 'what datasource', 'which datasource',
+        'what names', 'project and datasource', 'project name', 'datasource name',
+        'should i use', 'mock data', 'publish'
+    ]
+
+    # Check if assistant recently asked about publishing
+    for msg in recent_assistant_msgs:
+        if any(pattern in msg for pattern in publish_ask_patterns):
+            log.info(f"Detected publish follow-up context from assistant msg: {msg[:100]}")
+            return True
+
+    # Check recalled snippets for publish context (recent conversation)
+    snippet_text = ' '.join((recalled_snippets or [])[-10:]).lower()
+    if 'publish' in snippet_text or 'mock' in snippet_text:
+        user_lower = (user_text or '').lower()
+        # User is likely providing name-like info (not just casual chat)
+        name_indicators = ['project', 'datasource', 'name', 'is', 'use', 'for', 'and', 'call']
+        if any(indicator in user_lower for indicator in name_indicators):
+            log.info("Detected publish follow-up from snippets + user text patterns")
+            return True
+
+    return False
+
+
+def _extract_project_datasource_names(text: str) -> Dict[str, Optional[str]]:
+    """
+    Extract project and datasource names from user text using LLM.
+    This handles ANY naming pattern flexibly.
+    """
+    result = {'project_name': None, 'datasource_name': None}
+
+    try:
+        sys = SystemMessage(content=(
+            "Extract EXACTLY the project name and datasource name from the user's message.\n"
+            "The user may phrase it in many ways:\n"
+            "- 'project name is X and datasource name is Y'\n"
+            "- 'use X for project, Y for datasource'\n"
+            "- 'X and Y' (when asking about publishing)\n"
+            "- 'project: X, datasource: Y'\n"
+            "- 'call it X and Y'\n"
+            "- any other natural phrasing\n\n"
+            "Be flexible but precise. Extract the actual names, preserving exact spelling, spaces, and capitalization.\n"
+            "If only one name is clear, populate that field. If neither is clear, return nulls."
+        ))
+        prompt = HumanMessage(content=f"User message: {text}\n\nExtract names:")
+
+        class NameExtraction(BaseModel):
+            project_name: Optional[str] = None
+            datasource_name: Optional[str] = None
+
+        structured = llm_parsing.with_structured_output(NameExtraction)
+        extraction: NameExtraction = safe_llm_invoke(structured, [sys, prompt])
+
+        if extraction.project_name:
+            result['project_name'] = extraction.project_name.strip()
+        if extraction.datasource_name:
+            result['datasource_name'] = extraction.datasource_name.strip()
+
+        log.info(f"LLM extracted from '{(text or '')[:50]}...': {result}")
+    except Exception as e:
+        log.warning(f"Name extraction failed: {e}")
+
+    return result
+
 
 # ---------------- Memory layer ----------------
 def _truncate(s: str, n: int = 200) -> str:
@@ -897,12 +969,29 @@ def router(state: AgentState) -> AgentState:
         pub = parsed.publish or PublishArgs()
         pn = (pub.project_name or "").strip()
         dn = (pub.datasource_name or "").strip()
-        if not pn or not dn or pn == "AI Demos" or dn == "AI_Sample_Sales":
-            log.warning(f"PUBLISH_MOCK intent but missing names: pn={pn}, dn={dn}. Falling back.")
+    if parsed.intent == Intent.PUBLISH_MOCK:
+        pub = parsed.publish or PublishArgs()
+        pn = (pub.project_name or "").strip()
+        dn = (pub.datasource_name or "").strip()
+
+        # Improved validation: Also check for default placeholder values
+        missing_or_default = (
+            not pn or not dn or 
+            pn.lower() in ("ai demos", "aidemos", "default") or 
+            dn.lower() in ("ai_sample_sales", "aisamplesales", "default", "sample")
+        )
+
+        if missing_or_default:
+            log.warning(f"PUBLISH_MOCK needs names: pn='{pn}', dn='{dn}'")
+            # Store a hint in session defaults that we're waiting for publish args
+            DEFAULTS_BY_SESSION[session_id]['_awaiting_publish'] = True
             return {
                 "final_text": "No problem—what project and datasource names should I use for that?",
                 "route": "finalize"
             }
+
+        # Clear the awaiting flag if it was set
+        DEFAULTS_BY_SESSION[session_id].pop('_awaiting_publish', None)
         return {"route": "call_tool_publish"}
 
     if parsed.intent in (Intent.LIST_PROJECTS, Intent.LIST_WORKBOOKS, Intent.LIST_VIEWS):
@@ -1073,6 +1162,5 @@ def build_graph():
     graph.add_edge("call_tool_publish", "postprocess")
     graph.add_edge("postprocess", "finalize")
 
-    checkpointer = MemorySaver()
-    app_graph = graph.compile(checkpointer=checkpointer)  # Enable checkpointing
-    return app_graph
+   # No checkpointer: state is per-request only (no persistence between calls)
+    return graph.compile()
