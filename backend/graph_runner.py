@@ -27,7 +27,8 @@ from tab_tools import (
 )
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from google.api_core.exceptions import ResourceExhausted,DeadlineExceeded  # Import for retry_if
-
+import pandas as pd  
+from io import StringIO
 # Add this decorator to LLM functions
 @retry(
     retry=retry_if_exception_type((ResourceExhausted, DeadlineExceeded)),
@@ -214,16 +215,24 @@ def _merge_defaults(base: Dict[str, Any], new: Dict[str, Any]) -> Dict[str, Any]
 def _llm_infer_defaults_from_snippets(recalled: List[str]) -> Dict[str, Any]:
     if not recalled:
         return {}
+    # Prioritize filter-related snippets (e.g., "south region only as thats our market scope")
+    filter_snippets = [s for s in recalled if any(kw in s.lower() for kw in ['filter', 'region', 'south', 'market scope', 'only'])]
+    all_snippets = filter_snippets + [s for s in recalled if s not in filter_snippets]  # Filters first
+    
     sys = SystemMessage(content=(
         "From the following conversation snippets, infer the user's CURRENT defaults.\n"
         "Only include fields you are confident about: project_name, datasource_name, workbook_name, view_name, filters (object).\n"
+        "Prioritize **filters** if mentioned (e.g., {'Region': 'South'} from 'south region only').\n"
         "Prefer the most recent information if there are conflicts. If nothing concrete, return an empty object."
     ))
-    prompt = "Snippets (most recent last):\n- " + "\n- ".join(recalled or [])
+    prompt = "Snippets (most recent last, filters prioritized):\n- " + "\n- ".join(all_snippets or [])
     try:
         structured = llm.with_structured_output(DefaultPrefs)
         prefs: DefaultPrefs = structured.invoke([sys, HumanMessage(content=prompt)])
-        return prefs.model_dump(exclude_none=True)
+        inferred = prefs.model_dump(exclude_none=True)
+        if inferred.get('filters'):
+            log.info("Inferred filters from snippets: %s", inferred['filters'])
+        return inferred
     except Exception:
         return {}
 
@@ -379,6 +388,8 @@ def apply_defaults_to_parsed(
         f_explicit = parsed.filters_json or {}
         merged = dict(f_defaults or {})
         merged.update(f_explicit or {})
+        if merged:  # Log if applying inferred filters
+            log.info("Applied merged filters: %s (explicit: %s, default: %s)", merged, f_explicit, f_defaults)
         parsed.filters_json = merged or None
 
     return parsed
@@ -462,6 +473,24 @@ def _extract_project_datasource_names(text: str) -> Dict[str, Optional[str]]:
 
     return result
 
+class Filters(BaseModel):
+    filters: Optional[Dict[str, Any]] = None
+
+def _extract_filters_from_text(text: str, recalled: List[str]) -> Optional[Dict[str, Any]]:
+    sys = SystemMessage(content=(
+        "Extract filters from the user's response as a dict like {'Region': 'South', 'Year': 2024}. "
+        "Use common Tableau field names like Region, Category, Sales, Order Date, etc. "
+        "If unclear or no filters mentioned, return empty dict. Be conservative and only include explicit key-value pairs."
+    ))
+    context = "\n".join(recalled[-3:]) if recalled else ""
+    prompt = HumanMessage(content=f"Context: {context}\nUser filters request: {text}")
+    try:
+        structured = llm_parsing.with_structured_output(Filters)
+        res: Filters = safe_llm_invoke(structured, [sys, prompt])
+        return res.filters or {}
+    except Exception as e:
+        log.warning(f"Filter extraction failed: {e}")
+        return {}
 
 # ---------------- Memory layer ----------------
 def _truncate(s: str, n: int = 200) -> str:
@@ -793,7 +822,7 @@ def _write_csv(rows: list, columns: list, prefix: str = "tableau_export") -> str
 
 def _extract_attachments(tool_steps: List[Dict[str, Any]]):
     attachments = []
-    for step in tool_steps:
+    for step in tool_steps[-1:]:  # Only latest step to avoid concat
         s = step.get("result")
         if not s: continue
         s = s if isinstance(s, str) else str(s)
@@ -807,6 +836,19 @@ def _extract_attachments(tool_steps: List[Dict[str, Any]]):
                 if isinstance(tbl, list) and tbl:
                     cols = obj.get("columns", [])
                     caption = obj.get("text", "")
+                    # NEW: If table is full, but we have filters in step args, filter here too (redundancy)
+                    filters_json = json.loads(step.get("args", {}).get("filters_json", "{}"))
+                    if filters_json:
+                        try:
+                            df = pd.DataFrame(tbl)
+                            for col, val in filters_json.items():
+                                if col in df.columns:
+                                    df = df[df[col].astype(str) == str(val)]
+                            tbl = df.to_dict('records')
+                            cols = list(df.columns) if df.columns.tolist() != cols else cols
+                            log.info("Attachment table filtered to %d rows", len(tbl))
+                        except Exception:
+                            pass
                     attachments.append({
                         "type": "table",
                         "rows": tbl,
@@ -819,7 +861,7 @@ def _extract_attachments(tool_steps: List[Dict[str, Any]]):
                         "mime": "text/csv",
                         "path": csv_path,
                         "filename": os.path.basename(csv_path),
-                        "caption": caption or "Exported data",
+                        "caption": caption or "Exported data (filtered)",
                     })
                 continue
         except Exception:
@@ -828,7 +870,7 @@ def _extract_attachments(tool_steps: List[Dict[str, Any]]):
             start = s.find('data:image/')
             end = s.find('==', start) + 2
             attachments.append({"type": "image", "dataUrl": s[start:end], "caption": ""})
-    return attachments
+    return attachments  # Already deduped via latest step
 
 class AgentState(TypedDict, total=False):
     session_id: str
@@ -843,11 +885,14 @@ class AgentState(TypedDict, total=False):
     parsed: ParsedCommand
     route: str
 
-    tool_steps: Annotated[List[Dict[str, Any]], operator.add]   
-    attachments: Annotated[List[Dict[str, Any]], operator.add]  
+    tool_steps: List[Dict[str, Any]] 
+    attachments: List[Dict[str, Any]]
 
     final_text: str
     error: str
+
+    awaiting_filters: bool
+    pending_view: Dict[str, Any]
 
 # 1) Ingest user message
 def ingest(state: AgentState) -> AgentState:
@@ -857,8 +902,8 @@ def ingest(state: AgentState) -> AgentState:
         # reset transient/turn-scoped fields
         "route": None,
         "final_text": "",
-        "tool_steps": [],
-        "attachments": [],
+        "tool_steps": [],  # Already reset, but ensure
+        "attachments": [],  # Explicitly reset to prevent concat
         "defaults_cmd": DefaultsAction(),  # optional
         "parsed": None,                    # optional
     }
@@ -932,6 +977,44 @@ def router(state: AgentState) -> AgentState:
     print(parsed)
     print(session_id)
     print(recalled)
+
+    # Handle awaiting filters case
+    if state.get("awaiting_filters", False):
+        user_lower = state["user_text"].lower().strip()
+        decline_phrases = ["no", "none", "no thanks", "without filters", "all", "unfiltered", "default", "no filter"]
+        if any(phrase in user_lower for phrase in decline_phrases):
+            pending = state.get("pending_view", {})
+            parsed = ParsedCommand(
+                intent=pending.get("intent", Intent.VIEW_DATA),
+                view_name=pending.get("view_name"),
+                workbook_name=pending.get("workbook_name"),
+                filters_json=None,
+                reason="User chose no filters"
+            )
+            return {
+                "parsed": parsed,
+                "awaiting_filters": False,
+                "pending_view": {},
+                "route": "call_tool_view"
+            }
+        else:
+            # Extract filters from user text
+            filters = _extract_filters_from_text(state["user_text"], recalled)
+            pending = state.get("pending_view", {})
+            parsed = ParsedCommand(
+                intent=pending.get("intent", Intent.VIEW_DATA),
+                view_name=pending.get("view_name"),
+                workbook_name=pending.get("workbook_name"),
+                filters_json=filters,
+                reason="Extracted filters from user response"
+            )
+            return {
+                "parsed": parsed,
+                "awaiting_filters": False,
+                "pending_view": {},
+                "route": "call_tool_view"
+            }
+
     if parsed.intent == Intent.MEMORY_SET:
         fact = parsed.memory_fact or {}
         if fact:
@@ -1005,7 +1088,21 @@ def router(state: AgentState) -> AgentState:
         return {"route": "call_tool_list"}
 
     if parsed.intent in (Intent.VIEW_IMAGE, Intent.VIEW_DATA):
-        return {"route": "call_tool_view"}
+        # NEW: If inferred/merged filters exist, skip prompt and apply directly
+        if parsed.filters_json:
+            log.info("Skipping filter prompt; applying inferred filters: %s", parsed.filters_json)
+            return {"route": "call_tool_view"}
+        else:
+            return {
+                "awaiting_filters": True,
+                "pending_view": {
+                    "intent": parsed.intent,
+                    "view_name": parsed.view_name,
+                    "workbook_name": parsed.workbook_name
+                },
+                "final_text": f"Got it—you want to {'see an image of' if parsed.intent == Intent.VIEW_IMAGE else 'get data from'} the '{parsed.view_name}' view{ ' in workbook ' + parsed.workbook_name if parsed.workbook_name else '' }. Do you want to apply any filters (e.g., 'Region: South' or 'Sales > 10000')? Reply 'no' if not.",
+                "route": "finalize"
+            }
 
     # Unknown: polite fallback
     return {
@@ -1062,7 +1159,47 @@ def call_tool_view(state: AgentState) -> AgentState:
         result = f"Tool '{name}' failed: {e}"
         log.error("Tool call failed: %s", e)
 
+    # NEW: For VIEW_DATA, apply client-side filter if filters provided (fallback if tool ignores)
+    if parsed.intent == Intent.VIEW_DATA and parsed.filters_json:
+        try:
+            # Assume result is JSON with 'table' (list of dicts) or CSV string
+            if isinstance(result, str) and result.startswith('{'):
+                obj = json.loads(result)
+                table = obj.get('table', [])
+                if table and isinstance(table[0], dict):  # List of dicts
+                    df = pd.DataFrame(table)
+                    for col, val in parsed.filters_json.items():
+                        if col in df.columns:
+                            df = df[df[col] == val]  # Exact match; extend for >/< if needed
+                            log.info("Client-side filtered %s rows on %s=%s", len(df), col, val)
+                    obj['table'] = df.to_dict('records')
+                    result = json.dumps(obj)
+                elif 'Returned' in result and '\t' in result:  # TSV/CSV string
+                    # Parse as TSV (from logs: tab-separated)
+                    lines = result.split('\n')
+                    if len(lines) > 1:
+                        df = pd.read_csv(StringIO('\n'.join(lines)), sep='\t')
+                        for col, val in parsed.filters_json.items():
+                            if col in df.columns:
+                                df = df[df[col].astype(str) == str(val)]
+                                log.info("Client-side filtered %s rows on %s=%s", len(df), col, val)
+                        # Reconstruct TSV
+                        tsv_str = df.to_csv(sep='\t', index=False)
+                        result = result.split('\n')[0] + '\n' + tsv_str  # Preserve header like "Returned X rows"
+            log.info("Post-tool filter applied successfully")
+        except Exception as fe:
+            log.warning("Client-side filter failed: %s", fe)
+
     step = {"name": name, "args": args, "result": result}
+    state["tool_steps"] = [step]  # Ensure single step
+
+    # NEW: If VIEW_DATA succeeded with filters, persist as default
+    if parsed.intent == Intent.VIEW_DATA and parsed.filters_json:
+        session_id = state["session_id"]
+        DEFAULTS_BY_SESSION[session_id] = _merge_defaults(DEFAULTS_BY_SESSION.get(session_id, {}), {'filters': parsed.filters_json})
+        LANGMEM.add(session_id, f"[DEFAULTS] Persistent filter for {parsed.view_name}: {json.dumps(parsed.filters_json)} (market scope)")
+        log.info("Persisted filters as default: %s", parsed.filters_json)
+
     return {"tool_steps": [step]}
 
 # 6c) Call publish tool

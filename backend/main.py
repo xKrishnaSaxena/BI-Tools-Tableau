@@ -46,13 +46,9 @@ def _dedupe_attachments(attachments: List[Dict[str, Any]]) -> List[Dict[str, Any
 async def chat_endpoint(request: ChatRequest):
     session_id = request.session_id or "default"
     init_state = {
-    "session_id": session_id,
-    "user_text": request.message.strip(),
-    # Removed "messages": [] to allow persistence via checkpoint
-    "tool_steps": [],  # Explicitly reset to avoid accumulation
-    "attachments": [],  # Reset
-    "recalled": [],  # Optional: if you want fresh recall each time
-}
+        "session_id": session_id,
+        "user_text": request.message.strip(),
+    }
 
     out = await GRAPH.ainvoke(
     init_state,
