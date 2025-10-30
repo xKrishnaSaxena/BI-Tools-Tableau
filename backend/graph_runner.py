@@ -998,15 +998,15 @@ def router(state: AgentState) -> AgentState:
                 "route": "call_tool_view"
             }
         else:
-            # Extract filters from user text
-            filters = _extract_filters_from_text(state["user_text"], recalled)
+            # Use the inferred filters from main parse instead of separate extraction
+            inferred_filters = state["parsed"].filters_json
             pending = state.get("pending_view", {})
             parsed = ParsedCommand(
                 intent=pending.get("intent", Intent.VIEW_DATA),
                 view_name=pending.get("view_name"),
                 workbook_name=pending.get("workbook_name"),
-                filters_json=filters,
-                reason="Extracted filters from user response"
+                filters_json=inferred_filters,
+                reason="Applied inferred filter from user response to pending view request"
             )
             return {
                 "parsed": parsed,
@@ -1168,24 +1168,54 @@ def call_tool_view(state: AgentState) -> AgentState:
                 table = obj.get('table', [])
                 if table and isinstance(table[0], dict):  # List of dicts
                     df = pd.DataFrame(table)
+                    original_text = obj.get('text', '')
                     for col, val in parsed.filters_json.items():
                         if col in df.columns:
-                            df = df[df[col] == val]  # Exact match; extend for >/< if needed
+                            df = df[df[col].astype(str) == str(val)]
                             log.info("Client-side filtered %s rows on %s=%s", len(df), col, val)
                     obj['table'] = df.to_dict('records')
+                    # Update the text with new row count and view name
+                    from_str = original_text.rfind("from '")
+                    if from_str != -1:
+                        end = original_text.find("'.", from_str)
+                        if end != -1:
+                            view_name = original_text[from_str+6:end]
+                            obj['text'] = f"Returned {len(df)} rows from '{view_name}'."
+                        else:
+                            obj['text'] = f"Returned {len(df)} rows (filtered)."
+                    else:
+                        obj['text'] = f"Returned {len(df)} rows (filtered)."
                     result = json.dumps(obj)
                 elif 'Returned' in result and '\t' in result:  # TSV/CSV string
                     # Parse as TSV (from logs: tab-separated)
                     lines = result.split('\n')
                     if len(lines) > 1:
-                        df = pd.read_csv(StringIO('\n'.join(lines)), sep='\t')
+                        # Skip non-data lines (e.g., "Returned...", "Download CSV")
+                        data_start = 0
+                        for i, line in enumerate(lines):
+                            if line.strip() and '\t' in line and not line.startswith('Returned') and not line.strip() == "Download CSV":
+                                data_start = i
+                                break
+                        data_lines = lines[data_start:]
+                        df = pd.read_csv(StringIO('\n'.join(data_lines)), sep='\t')
+                        original_text = lines[0] if lines else ''
                         for col, val in parsed.filters_json.items():
                             if col in df.columns:
                                 df = df[df[col].astype(str) == str(val)]
                                 log.info("Client-side filtered %s rows on %s=%s", len(df), col, val)
-                        # Reconstruct TSV
+                        # Reconstruct TSV with updated header
+                        from_str = original_text.rfind("from '")
+                        if from_str != -1:
+                            end = original_text.find("'.", from_str)
+                            if end != -1:
+                                view_name = original_text[from_str+6:end]
+                                header = f"Returned {len(df)} rows from '{view_name}'.\nDownload CSV\n"
+                            else:
+                                header = f"Returned {len(df)} rows (filtered).\nDownload CSV\n"
+                        else:
+                            header = f"Returned {len(df)} rows (filtered).\nDownload CSV\n"
                         tsv_str = df.to_csv(sep='\t', index=False)
-                        result = result.split('\n')[0] + '\n' + tsv_str  # Preserve header like "Returned X rows"
+                        result = header + tsv_str
             log.info("Post-tool filter applied successfully")
         except Exception as fe:
             log.warning("Client-side filter failed: %s", fe)
