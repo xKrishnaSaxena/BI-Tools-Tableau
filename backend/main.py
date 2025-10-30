@@ -17,7 +17,7 @@ app.add_middleware(
         "https://agent-tableau.onrender.com",
         "http://localhost:5173",
         "https://enmployee-os-gq96.vercel.app",
-        "https://employee-os.vercel.app/"
+        "https://employee-os.vercel.app"
     ],
     allow_credentials=True,
     allow_methods=["*"],
